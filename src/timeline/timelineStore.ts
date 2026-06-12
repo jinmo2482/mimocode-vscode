@@ -179,7 +179,7 @@ export class TimelineStore {
             case 'session.diff': {
                 const sessionID = event.properties.sessionID as string | undefined;
                 const diff = (event.properties.diff || event.properties.diffs) as FileDiff[] | undefined;
-                if (!sessionID || !diff) {
+                if (!sessionID || !Array.isArray(diff) || diff.length === 0) {
                     return undefined;
                 }
                 const timelineDiff = this.addDiff(sessionID, diff, event.properties.messageID as string | undefined);

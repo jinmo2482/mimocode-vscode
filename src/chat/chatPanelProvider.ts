@@ -60,7 +60,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
 
     async newSession(): Promise<void> {
         try {
-            const session = await this._apiClient.newSession();
+            const directory = this._editorContext.getWorkspaceRoot();
+            const session = await this._apiClient.newSession(directory ? { directory } : undefined);
             this._currentSessionId = session.id;
             await this.reloadSessions();
             await this.loadSession(session.id);
@@ -94,7 +95,18 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             await this.loadConfigAndProviders();
 
             if (!this._currentSessionId && this._sessions.length > 0) {
-                this._currentSessionId = this._sessions[0].id;
+                const workspaceRoot = this._editorContext.getWorkspaceRoot();
+                if (workspaceRoot) {
+                    // Prefer the most recent session whose directory matches the workspace
+                    const match = this._sessions.find(s => s.directory === workspaceRoot);
+                    if (match) {
+                        this._currentSessionId = match.id;
+                    }
+                    // If no match, leave undefined — user will get a new session on first prompt
+                } else {
+                    // No workspace — fall back to the most recent session
+                    this._currentSessionId = this._sessions[0].id;
+                }
             }
 
             if (this._currentSessionId) {
@@ -110,7 +122,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     }
 
     private async reloadSessions(): Promise<void> {
-        this._sessions = await this._apiClient.listSessions({ limit: 100 });
+        const workspaceRoot = this._editorContext.getWorkspaceRoot();
+        const opts: { directory?: string; limit: number } = { limit: 100 };
+        if (workspaceRoot) {
+            opts.directory = workspaceRoot;
+        }
+        this._sessions = await this._apiClient.listSessions(opts);
         this.postShellState();
     }
 
@@ -156,10 +173,30 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     }
 
     private async ensureSession(): Promise<string> {
+        const workspaceRoot = this._editorContext.getWorkspaceRoot();
+
         if (this._currentSessionId) {
-            return this._currentSessionId;
+            // Verify the current session belongs to this workspace
+            if (workspaceRoot) {
+                const currentSession = this._sessions.find(s => s.id === this._currentSessionId);
+                if (currentSession && currentSession.directory !== workspaceRoot) {
+                    // Session is from a different workspace — find or create one for the current workspace
+                    const match = this._sessions.find(s => s.directory === workspaceRoot);
+                    if (match) {
+                        this._currentSessionId = match.id;
+                        return match.id;
+                    }
+                    // Fall through to create a new session
+                    this._currentSessionId = undefined;
+                } else {
+                    return this._currentSessionId;
+                }
+            } else {
+                return this._currentSessionId;
+            }
         }
-        const session = await this._apiClient.newSession();
+
+        const session = await this._apiClient.newSession(workspaceRoot ? { directory: workspaceRoot } : undefined);
         this._currentSessionId = session.id;
         await this.reloadSessions();
         this._timeline.reset(session, []);
@@ -214,6 +251,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                     break;
                 case 'signIn':
                     this._onSignInRequest?.();
+                    break;
+                case 'answerQuestion':
+                    await this.handleAnswerQuestion(msg.answer, msg.sessionId);
                     break;
             }
         } catch (err) {
@@ -298,6 +338,18 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         this.postMessage({ type: 'mentionContent', item, content });
     }
 
+    private async handleAnswerQuestion(answer: string, sessionId?: string): Promise<void> {
+        if (!answer) {
+            return;
+        }
+        try {
+            await this._apiClient.appendTuiPrompt(answer);
+        } catch (err) {
+            const message = 'Failed to answer MiMoCode question. The headless server may not support question replies yet.';
+            this.showError(message);
+        }
+    }
+
     private async refreshStatus(): Promise<void> {
         if (!this._currentSessionId) {
             return;
@@ -323,7 +375,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         const patch = this._timeline.applyEvent(event);
         if (event.type === 'session.diff' && sessionID) {
             const files = event.properties.diff;
-            if (Array.isArray(files)) {
+            if (Array.isArray(files) && files.length > 0) {
                 this._diffManager.addFileDiffs(sessionID, files, event.properties.messageID as string | undefined);
             }
         }

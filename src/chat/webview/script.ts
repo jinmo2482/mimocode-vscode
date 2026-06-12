@@ -102,6 +102,34 @@ els.timeline.addEventListener('click', function(event) {
   if (!button) return;
   var action = button.getAttribute('data-action');
   if (!action) return;
+
+  // Handle question tool option clicks
+  if (action === 'answerQuestion') {
+    vscode.postMessage({
+      type: 'answerQuestion',
+      answer: button.getAttribute('data-answer') || '',
+      toolCallId: button.getAttribute('data-tool-call-id') || '',
+      messageId: button.getAttribute('data-message-id') || '',
+      sessionId: button.getAttribute('data-session-id') || ''
+    });
+    return;
+  }
+  // Handle question tool text input submit
+  if (action === 'answerQuestionInput') {
+    var card = button.closest('.question-card');
+    var inputEl = card ? card.querySelector('.question-input') : null;
+    var answer = inputEl ? inputEl.value.trim() : '';
+    if (!answer) return;
+    vscode.postMessage({
+      type: 'answerQuestion',
+      answer: answer,
+      toolCallId: button.getAttribute('data-tool-call-id') || '',
+      messageId: button.getAttribute('data-message-id') || '',
+      sessionId: button.getAttribute('data-session-id') || ''
+    });
+    return;
+  }
+
   var msg = { type: action };
   var diffId = button.getAttribute('data-diff-id');
   if (diffId) msg.diffId = diffId;
@@ -182,7 +210,10 @@ function renderTimeline() {
     chunks.push(renderMessage(timeline.messages[i]));
   }
   for (var i = 0; i < (timeline.diffs || []).length; i++) {
-    chunks.push(renderSessionDiff(timeline.diffs[i]));
+    var d = timeline.diffs[i];
+    if (d.files && d.files.length > 0) {
+      chunks.push(renderSessionDiff(d));
+    }
   }
   for (var i = 0; i < (timeline.errors || []).length; i++) {
     chunks.push(renderErrorCard(timeline.errors[i].message));
@@ -232,6 +263,9 @@ function renderPart(part) {
     case 'reasoning':
       return renderCollapsible('Reasoning', part.text || '', 'part');
     case 'tool':
+      if (part.tool === 'question') {
+        return renderQuestionTool(part);
+      }
       return renderTool(part);
     case 'step-start':
       return renderStepStart(part);
@@ -279,6 +313,68 @@ function renderTool(part) {
     summaryLine +
     (body ? '<div class="card-detail"><pre>' + escapeHtml(body) + '</pre></div>' : '') +
   '</details>';
+}
+
+/* ── Question tool ── */
+function renderQuestionTool(part) {
+  var s = part.state || {};
+  var status = s.status || 'pending';
+  var input = s.input || {};
+  var questions = input.questions || [];
+  var toolCallId = part.callID || '';
+  var messageId = part.messageID || '';
+  var sessionId = part.sessionID || '';
+  var answered = status === 'completed' || status === 'error';
+
+  var chunks = [];
+  chunks.push('<div class="card question-card' + (answered ? ' answered' : '') + '">');
+  chunks.push('<div class="card-row">');
+  chunks.push('<span class="card-icon">&#x2753;</span>');
+  chunks.push('<span class="card-title">Question</span>');
+  chunks.push('<span class="card-badge ' + escapeAttr(status) + '">' + escapeHtml(status) + '</span>');
+  chunks.push('</div>');
+
+  for (var qi = 0; qi < questions.length; qi++) {
+    var q = questions[qi];
+    var header = q.header || '';
+    var questionText = q.question || '';
+    var options = q.options || [];
+
+    if (header) {
+      chunks.push('<div class="question-header">' + escapeHtml(header) + '</div>');
+    }
+    if (questionText) {
+      chunks.push('<div class="question-text">' + escapeHtml(questionText) + '</div>');
+    }
+
+    if (!answered) {
+      if (options.length > 0) {
+        chunks.push('<div class="question-options">');
+        for (var oi = 0; oi < options.length; oi++) {
+          var opt = options[oi];
+          var optLabel = typeof opt === 'string' ? opt : (opt.label || opt.value || '');
+          var optDesc = typeof opt === 'object' ? (opt.description || opt.hint || '') : '';
+          var optValue = typeof opt === 'object' ? (opt.value || opt.label || '') : opt;
+          chunks.push('<button class="question-opt-btn" data-action="answerQuestion" data-answer="' + escapeAttr(optValue) + '" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '">' + escapeHtml(optLabel) + (optDesc ? '<span class="question-opt-desc">' + escapeHtml(optDesc) + '</span>' : '') + '</button>');
+        }
+        chunks.push('</div>');
+      } else {
+        // Free-text input fallback
+        chunks.push('<div class="question-text-input">');
+        chunks.push('<input type="text" class="question-input" placeholder="Type your answer..." data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" />');
+        chunks.push('<button class="question-submit-btn" data-action="answerQuestionInput" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '">Submit</button>');
+        chunks.push('</div>');
+      }
+    }
+  }
+
+  // Show output if already answered
+  if (s.output) {
+    chunks.push('<div class="card-detail"><pre>' + escapeHtml(s.output) + '</pre></div>');
+  }
+
+  chunks.push('</div>');
+  return chunks.join('');
 }
 
 /* ── Step start ── */
@@ -526,6 +622,16 @@ function renderMarkdown(text) {
 
   return html;
 }
+
+/* ── Question input enter key ── */
+els.timeline.addEventListener('keydown', function(event) {
+  if (event.key === 'Enter' && event.target.classList.contains('question-input')) {
+    event.preventDefault();
+    var card = event.target.closest('.question-card');
+    var submitBtn = card ? card.querySelector('.question-submit-btn') : null;
+    if (submitBtn) submitBtn.click();
+  }
+});
 
 vscode.postMessage({ type: 'ready' });`;
 }

@@ -52,6 +52,15 @@ export class EditorContext {
     }
 
     getWorkspaceRoot(): string | undefined {
+        // Prefer the workspace folder containing the active text editor
+        const activeEditor = vscode.window.activeTextEditor;
+        if (activeEditor) {
+            const folder = vscode.workspace.getWorkspaceFolder(activeEditor.document.uri);
+            if (folder) {
+                return folder.uri.fsPath;
+            }
+        }
+        // Fall back to the first workspace folder
         return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     }
 
