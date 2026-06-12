@@ -105,27 +105,65 @@ els.timeline.addEventListener('click', function(event) {
 
   // Handle question tool option clicks
   if (action === 'answerQuestion') {
+    var qAnswer = button.getAttribute('data-answer') || '';
+    var qToolCallId = button.getAttribute('data-tool-call-id') || '';
+    var qMessageId = button.getAttribute('data-message-id') || '';
+    var qSessionId = button.getAttribute('data-session-id') || '';
+    var qRequestId = button.getAttribute('data-request-id') || '';
+    console.log('[MiMoCode Webview] answerQuestion clicked', {
+      answer: qAnswer,
+      toolCallId: qToolCallId,
+      messageId: qMessageId,
+      sessionId: qSessionId,
+      requestID: qRequestId
+    });
+    // Disable all option buttons in this card and show sent state
+    var qCard = button.closest('.question-card');
+    if (qCard) {
+      var allBtns = qCard.querySelectorAll('.question-opt-btn');
+      for (var bi = 0; bi < allBtns.length; bi++) {
+        allBtns[bi].disabled = true;
+        allBtns[bi].classList.add('question-opt-disabled');
+      }
+      button.classList.add('question-opt-selected');
+      button.textContent = button.textContent + ' ✓';
+    }
     vscode.postMessage({
       type: 'answerQuestion',
-      answer: button.getAttribute('data-answer') || '',
-      toolCallId: button.getAttribute('data-tool-call-id') || '',
-      messageId: button.getAttribute('data-message-id') || '',
-      sessionId: button.getAttribute('data-session-id') || ''
+      answer: qAnswer,
+      toolCallId: qToolCallId,
+      messageId: qMessageId,
+      sessionId: qSessionId,
+      requestID: qRequestId
     });
     return;
   }
   // Handle question tool text input submit
   if (action === 'answerQuestionInput') {
-    var card = button.closest('.question-card');
-    var inputEl = card ? card.querySelector('.question-input') : null;
-    var answer = inputEl ? inputEl.value.trim() : '';
-    if (!answer) return;
+    var qCard2 = button.closest('.question-card');
+    var inputEl = qCard2 ? qCard2.querySelector('.question-input') : null;
+    var textAnswer = inputEl ? inputEl.value.trim() : '';
+    if (!textAnswer) return;
+    var qToolCallId2 = button.getAttribute('data-tool-call-id') || '';
+    var qMessageId2 = button.getAttribute('data-message-id') || '';
+    var qSessionId2 = button.getAttribute('data-session-id') || '';
+    var qRequestId2 = button.getAttribute('data-request-id') || '';
+    console.log('[MiMoCode Webview] answerQuestionInput submitted', {
+      answer: textAnswer,
+      toolCallId: qToolCallId2,
+      requestID: qRequestId2
+    });
+    // Disable input and button
+    if (inputEl) inputEl.disabled = true;
+    button.disabled = true;
+    button.textContent = 'Sent ✓';
     vscode.postMessage({
       type: 'answerQuestion',
-      answer: answer,
-      toolCallId: button.getAttribute('data-tool-call-id') || '',
-      messageId: button.getAttribute('data-message-id') || '',
-      sessionId: button.getAttribute('data-session-id') || ''
+      answer: textAnswer,
+      toolCallId: qToolCallId2,
+      messageId: qMessageId2,
+      sessionId: qSessionId2,
+      requestID: qRequestId2
     });
     return;
   }
@@ -324,6 +362,7 @@ function renderQuestionTool(part) {
   var toolCallId = part.callID || '';
   var messageId = part.messageID || '';
   var sessionId = part.sessionID || '';
+  var requestID = part._questionRequestID || '';
   var answered = status === 'completed' || status === 'error';
 
   var chunks = [];
@@ -355,14 +394,14 @@ function renderQuestionTool(part) {
           var optLabel = typeof opt === 'string' ? opt : (opt.label || opt.value || '');
           var optDesc = typeof opt === 'object' ? (opt.description || opt.hint || '') : '';
           var optValue = typeof opt === 'object' ? (opt.value || opt.label || '') : opt;
-          chunks.push('<button class="question-opt-btn" data-action="answerQuestion" data-answer="' + escapeAttr(optValue) + '" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '">' + escapeHtml(optLabel) + (optDesc ? '<span class="question-opt-desc">' + escapeHtml(optDesc) + '</span>' : '') + '</button>');
+          chunks.push('<button class="question-opt-btn" data-action="answerQuestion" data-answer="' + escapeAttr(optValue) + '" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '">' + escapeHtml(optLabel) + (optDesc ? '<span class="question-opt-desc">' + escapeHtml(optDesc) + '</span>' : '') + '</button>');
         }
         chunks.push('</div>');
       } else {
         // Free-text input fallback
         chunks.push('<div class="question-text-input">');
-        chunks.push('<input type="text" class="question-input" placeholder="Type your answer..." data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" />');
-        chunks.push('<button class="question-submit-btn" data-action="answerQuestionInput" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '">Submit</button>');
+        chunks.push('<input type="text" class="question-input" placeholder="Type your answer..." data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '" />');
+        chunks.push('<button class="question-submit-btn" data-action="answerQuestionInput" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '">Submit</button>');
         chunks.push('</div>');
       }
     }

@@ -21,6 +21,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     private _disposables: vscode.Disposable[] = [];
     private _busy = false;
     private _onSignInRequest?: () => void;
+    private _pendingQuestions = new Map<string, string>(); // callID -> requestID
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -304,7 +305,13 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                     this._onSignInRequest?.();
                     break;
                 case 'answerQuestion':
-                    await this.handleAnswerQuestion(msg.answer, msg.sessionId);
+                    await this.handleAnswerQuestion({
+                        answer: msg.answer,
+                        sessionId: msg.sessionId,
+                        messageId: msg.messageId,
+                        toolCallId: msg.toolCallId,
+                        requestID: msg.requestID
+                    });
                     break;
             }
         } catch (err) {
@@ -409,16 +416,90 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         this.postMessage({ type: 'mentionContent', item, content });
     }
 
-    private async handleAnswerQuestion(answer: string, sessionId?: string): Promise<void> {
-        if (!answer) {
+    private async handleAnswerQuestion(payload: {
+        answer: string;
+        sessionId?: string;
+        messageId?: string;
+        toolCallId?: string;
+        requestID?: string;
+    }): Promise<void> {
+        if (!payload.answer) {
             return;
         }
-        try {
-            await this._apiClient.appendTuiPrompt(answer);
-        } catch (err) {
-            const message = 'Failed to answer MiMoCode question. The headless server may not support question replies yet.';
-            this.showError(message);
+
+        const sid = payload.sessionId || this._currentSessionId;
+        console.log('[MiMoCode] answerQuestion received', {
+            answer: payload.answer,
+            sessionId: payload.sessionId,
+            messageId: payload.messageId,
+            toolCallId: payload.toolCallId,
+            requestID: payload.requestID,
+            currentSessionId: this._currentSessionId
+        });
+
+        // Resolve requestID: from payload, from pending map, or try fetching
+        let requestID = payload.requestID;
+        if (!requestID && payload.toolCallId) {
+            requestID = this._pendingQuestions.get(payload.toolCallId);
         }
+        if (!requestID) {
+            requestID = await this.findPendingQuestionRequestID(sid);
+        }
+
+        if (requestID) {
+            try {
+                await this._apiClient.answerQuestion(requestID, [[payload.answer]]);
+                console.log('[MiMoCode] question answer sent via /question/:requestID/reply', { requestID, answers: [[payload.answer]] });
+                // Clean up pending map
+                if (payload.toolCallId) {
+                    this._pendingQuestions.delete(payload.toolCallId);
+                }
+                return;
+            } catch (err) {
+                console.warn('[MiMoCode] /question/:requestID/reply failed, trying appendTuiPrompt fallback', err);
+            }
+        } else {
+            console.warn('[MiMoCode] No requestID found for question answer, using appendTuiPrompt fallback');
+        }
+
+        // Fallback: appendTuiPrompt
+        try {
+            await this._apiClient.appendTuiPrompt(payload.answer + '\n');
+            console.log('[MiMoCode] question answer sent via appendTuiPrompt fallback');
+        } catch (err) {
+            this.showError('Failed to answer MiMoCode question. The headless question answer protocol may be unsupported.');
+        }
+    }
+
+    /**
+     * Try to find the requestID for a pending question by fetching GET /question.
+     * Matches by sessionID if available.
+     */
+    private async findPendingQuestionRequestID(sessionId?: string): Promise<string | undefined> {
+        try {
+            const questions = await (this._apiClient as any).request('GET', '/question') as Array<{
+                id: string;
+                sessionID: string;
+                tool?: { callID?: string };
+            }>;
+            if (!Array.isArray(questions) || questions.length === 0) {
+                return undefined;
+            }
+            // Find a question matching the current session
+            const match = sessionId
+                ? questions.find(q => q.sessionID === sessionId) || questions[0]
+                : questions[0];
+            if (match) {
+                // Store the mapping for future use
+                if (match.tool?.callID) {
+                    this._pendingQuestions.set(match.tool.callID, match.id);
+                }
+                return match.id;
+            }
+        } catch {
+            // ignore
+        }
+        return undefined;
     }
 
     private async refreshStatus(): Promise<void> {
@@ -430,6 +511,30 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     }
 
     private handleSseEvent(event: SseEvent): void {
+        // Handle question events regardless of session filter
+        if (event.type === 'question.asked') {
+            const requestID = event.properties?.id as string | undefined;
+            const callID = event.properties?.tool?.callID as string | undefined;
+            if (requestID && callID) {
+                this._pendingQuestions.set(callID, requestID);
+                console.log('[MiMoCode] question.asked captured', { requestID, callID });
+            }
+            return;
+        }
+        if (event.type === 'question.replied' || event.type === 'question.rejected') {
+            const requestID = event.properties?.requestID as string | undefined;
+            if (requestID) {
+                // Remove from pending map
+                for (const [callID, rid] of this._pendingQuestions.entries()) {
+                    if (rid === requestID) {
+                        this._pendingQuestions.delete(callID);
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
         const sessionID = event.properties?.sessionID as string | undefined;
         if (sessionID && this._currentSessionId && sessionID !== this._currentSessionId) {
             if (event.type === 'session.updated' || event.type === 'session.created' || event.type === 'session.deleted') {
@@ -488,7 +593,26 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     }
 
     private postTimeline(): void {
-        this.postMessage({ type: 'timelineSnapshot', snapshot: this._timeline.snapshot() });
+        const snapshot = this._timeline.snapshot();
+        this.injectQuestionRequestIDs(snapshot);
+        this.postMessage({ type: 'timelineSnapshot', snapshot });
+    }
+
+    /**
+     * Inject pending question requestIDs into question tool parts
+     * so the webview can use them when answering.
+     */
+    private injectQuestionRequestIDs(snapshot: { messages: Array<{ parts: Array<any> }> }): void {
+        for (const message of snapshot.messages) {
+            for (const part of message.parts) {
+                if (part.type === 'tool' && part.tool === 'question' && part.state?.status !== 'completed') {
+                    const requestID = this._pendingQuestions.get(part.callID);
+                    if (requestID && !part._questionRequestID) {
+                        part._questionRequestID = requestID;
+                    }
+                }
+            }
+        }
     }
 
     private postMessage(message: unknown): void {

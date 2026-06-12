@@ -579,6 +579,14 @@ export class ApiClient {
         return this.request('POST', '/tui/append-prompt', { text });
     }
 
+    async answerQuestion(requestID: string, answers: string[][]): Promise<boolean> {
+        return this.request('POST', `/question/${encodeURIComponent(requestID)}/reply`, { answers });
+    }
+
+    async rejectQuestion(requestID: string): Promise<boolean> {
+        return this.request('POST', `/question/${encodeURIComponent(requestID)}/reject`);
+    }
+
     async setModel(modelRef: string): Promise<ConfigInfo> {
         const config = await this.getConfig();
         return this.updateConfig({ ...config, model: modelRef });
