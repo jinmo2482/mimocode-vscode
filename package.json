@@ -1,0 +1,235 @@
+{
+  "name": "mimocode-vscode",
+  "displayName": "MiMoCode",
+  "description": "AI编程助手 - MiMoCode VSCode Extension",
+  "version": "0.2.0",
+  "publisher": "mimocode",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onView:mimocode.chatView",
+    "onView:mimocode.sessionsView",
+    "onCommand:mimocode.openChat",
+    "onCommand:mimocode.focusChat",
+    "onCommand:mimocode.askSelection",
+    "onCommand:mimocode.openTerminal",
+    "onCommand:mimocode.openNewTerminal",
+    "onCommand:mimocode.insertFileReference",
+    "onCommand:mimocode.signInProvider",
+    "onCommand:mimocode.viewProviders",
+    "onCommand:mimocode.refreshProviders",
+    "onCommand:mimocode.whoami"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "mimocode",
+          "title": "MiMoCode",
+          "icon": "resources/mimocode.svg"
+        }
+      ]
+    },
+    "views": {
+      "mimocode": [
+        {
+          "type": "webview",
+          "id": "mimocode.chatView",
+          "name": "Chat"
+        },
+        {
+          "type": "tree",
+          "id": "mimocode.sessionsView",
+          "name": "Sessions"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "mimocode.openChat",
+        "title": "Open Chat",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.focusChat",
+        "title": "Focus Chat",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.askSelection",
+        "title": "Ask MiMoCode",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.newSession",
+        "title": "New Session",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.acceptDiff",
+        "title": "Accept Change",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.rejectDiff",
+        "title": "Reject Change",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.acceptAllDiffs",
+        "title": "Accept All Changes",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.rejectAllDiffs",
+        "title": "Reject All Changes",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.abort",
+        "title": "Abort",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.setModel",
+        "title": "Set Model",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.switchSession",
+        "title": "Switch Session",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.refreshSessions",
+        "title": "Refresh Sessions",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.openTerminal",
+        "title": "Open MiMoCode Terminal",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.openNewTerminal",
+        "title": "Open MiMoCode in New Terminal",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.insertFileReference",
+        "title": "Insert File Reference",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.signInProvider",
+        "title": "Sign In to Provider",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.viewProviders",
+        "title": "View Providers",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.refreshProviders",
+        "title": "Refresh Provider Status",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.whoami",
+        "title": "Who Am I",
+        "category": "MiMoCode"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "mimocode.askSelection",
+          "when": "editorHasSelection",
+          "group": "mimocode@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "mimocode.openNewTerminal",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "mimocode.openChat",
+        "key": "ctrl+escape",
+        "mac": "cmd+escape"
+      },
+      {
+        "command": "mimocode.openNewTerminal",
+        "key": "ctrl+shift+escape",
+        "mac": "cmd+shift+escape"
+      },
+      {
+        "command": "mimocode.insertFileReference",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k"
+      }
+    ],
+    "configuration": {
+      "title": "MiMoCode",
+      "properties": {
+        "mimocode.server.port": {
+          "type": "number",
+          "default": 7860,
+          "description": "MiMoCode HTTP服务器端口"
+        },
+        "mimocode.server.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "自动启动MiMoCode服务器"
+        },
+        "mimocode.server.path": {
+          "type": "string",
+          "default": "mimo",
+          "description": "MiMoCode可执行文件路径"
+        },
+        "mimocode.model": {
+          "type": "string",
+          "description": "默认模型"
+        },
+        "mimocode.mode": {
+          "type": "string",
+          "enum": [
+            "code",
+            "chat",
+            "auto"
+          ],
+          "default": "auto",
+          "description": "默认模式"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
+    "watch": "npm run build -- --watch",
+    "package": "vsce package",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "eventsource-parser": "^3.0.0",
+    "highlight.js": "^11.11.1"
+  }
+}
