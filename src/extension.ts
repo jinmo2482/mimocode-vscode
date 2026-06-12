@@ -12,6 +12,15 @@ import { ConfigManager } from './config/configManager';
 import { SessionTreeProvider } from './tree/sessionTreeProvider';
 import { ProviderAuthController } from './provider/providerAuthController';
 
+function getWorkspaceRootForServer(): string | undefined {
+    const activeEditor = vscode.window.activeTextEditor;
+    if (activeEditor) {
+        const folder = vscode.workspace.getWorkspaceFolder(activeEditor.document.uri);
+        if (folder) return folder.uri.fsPath;
+    }
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+}
+
 let serverManager: ServerManager;
 let apiClient: ApiClient;
 let sseClient: SseClient;
@@ -32,7 +41,8 @@ export async function activate(context: vscode.ExtensionContext) {
     serverManager = new ServerManager({
         port: config.server.port,
         mimoPath: config.server.path,
-        autoStart: config.server.autoStart
+        autoStart: config.server.autoStart,
+        cwd: getWorkspaceRootForServer()
     });
     apiClient = new ApiClient(() => serverManager.baseUrl);
     sseClient = new SseClient();
@@ -188,7 +198,8 @@ export async function activate(context: vscode.ExtensionContext) {
         serverManager.updateConfig({
             port: newConfig.server.port,
             mimoPath: newConfig.server.path,
-            autoStart: newConfig.server.autoStart
+            autoStart: newConfig.server.autoStart,
+            cwd: getWorkspaceRootForServer()
         });
         void vscode.window.showInformationMessage('MiMoCode settings changed. Restart the MiMoCode server for port/path changes to apply.');
     });

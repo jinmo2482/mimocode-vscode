@@ -184,8 +184,8 @@
       "properties": {
         "mimocode.server.port": {
           "type": "number",
-          "default": 7860,
-          "description": "MiMoCode HTTP服务器端口"
+          "default": 0,
+          "description": "MiMoCode HTTP服务器端口 (0=自动分配)"
         },
         "mimocode.server.autoStart": {
           "type": "boolean",

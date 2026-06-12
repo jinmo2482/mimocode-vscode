@@ -6,6 +6,7 @@ export interface ServerConfig {
     port: number;
     mimoPath: string;
     autoStart: boolean;
+    cwd?: string;
 }
 
 export enum ServerState {
@@ -22,6 +23,7 @@ export class ServerManager implements vscode.Disposable {
     private _actualPort: number;
     private _mimoPath: string;
     private _autoStart: boolean;
+    private _cwd?: string;
     private _onStateChange = new vscode.EventEmitter<ServerState>();
     private _outputChannel: vscode.OutputChannel;
 
@@ -37,6 +39,7 @@ export class ServerManager implements vscode.Disposable {
         this._actualPort = config.port;
         this._mimoPath = config.mimoPath;
         this._autoStart = config.autoStart;
+        this._cwd = config.cwd;
         this._outputChannel = vscode.window.createOutputChannel('MiMoCode Server');
     }
 
@@ -58,11 +61,14 @@ export class ServerManager implements vscode.Disposable {
         }
 
         const args = ['serve', '--hostname', '127.0.0.1', '--port', String(this._port)];
+        const cwd = this._cwd || process.cwd();
         const commandLine = `${this._mimoPath} ${args.join(' ')}`;
         this._outputChannel.appendLine(`Starting MiMoCode server: ${commandLine}`);
+        this._outputChannel.appendLine(`Server cwd: ${cwd}`);
 
         try {
             this.process = spawn(this._mimoPath, args, {
+                cwd,
                 stdio: ['ignore', 'pipe', 'pipe'],
                 env: {
                     ...process.env,
@@ -203,6 +209,7 @@ export class ServerManager implements vscode.Disposable {
         this._actualPort = config.port;
         this._mimoPath = config.mimoPath;
         this._autoStart = config.autoStart;
+        this._cwd = config.cwd;
     }
 
     async restart(): Promise<void> {
