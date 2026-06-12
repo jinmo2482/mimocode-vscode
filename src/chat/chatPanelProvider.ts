@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { ApiClient, ApiError, ConfigInfo, PromptOptions, SessionInfo, SessionStatusInfo } from '../api/client';
 import { SseClient, SseEvent } from '../api/sseClient';
 import { EditorContext } from '../context/editorContext';
@@ -77,7 +78,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     async sendWithContext(text: string): Promise<void> {
         await this.ensureSession();
         this.show();
-        await this.handleSendPrompt(text, this._currentSessionId);
+        await this.handleSendPrompt(text);
     }
 
     async abort(): Promise<void> {
@@ -98,7 +99,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                 const workspaceRoot = this._editorContext.getWorkspaceRoot();
                 if (workspaceRoot) {
                     // Prefer the most recent session whose directory matches the workspace
-                    const match = this._sessions.find(s => s.directory === workspaceRoot);
+                    const normalizedRoot = normalizePathForCompare(workspaceRoot);
+                    const match = this._sessions.find(s => normalizePathForCompare(s.directory) === normalizedRoot);
                     if (match) {
                         this._currentSessionId = match.id;
                     }
@@ -127,7 +129,20 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         if (workspaceRoot) {
             opts.directory = workspaceRoot;
         }
-        this._sessions = await this._apiClient.listSessions(opts);
+
+        const sessions = await this._apiClient.listSessions(opts);
+
+        // Frontend filter: even if backend filters by directory, re-verify locally
+        // to avoid cross-workspace session leakage.
+        if (workspaceRoot) {
+            const normalizedRoot = normalizePathForCompare(workspaceRoot);
+            this._sessions = sessions.filter(s => {
+                return normalizePathForCompare(s.directory) === normalizedRoot;
+            });
+        } else {
+            this._sessions = sessions;
+        }
+
         this.postShellState();
     }
 
@@ -175,28 +190,45 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     private async ensureSession(): Promise<string> {
         const workspaceRoot = this._editorContext.getWorkspaceRoot();
 
-        if (this._currentSessionId) {
-            // Verify the current session belongs to this workspace
-            if (workspaceRoot) {
+        if (workspaceRoot) {
+            const normalizedRoot = normalizePathForCompare(workspaceRoot);
+
+            // If we have a current session, verify it belongs to this workspace
+            if (this._currentSessionId) {
                 const currentSession = this._sessions.find(s => s.id === this._currentSessionId);
-                if (currentSession && currentSession.directory !== workspaceRoot) {
-                    // Session is from a different workspace — find or create one for the current workspace
-                    const match = this._sessions.find(s => s.directory === workspaceRoot);
-                    if (match) {
-                        this._currentSessionId = match.id;
-                        return match.id;
-                    }
-                    // Fall through to create a new session
-                    this._currentSessionId = undefined;
-                } else {
+                if (currentSession && normalizePathForCompare(currentSession.directory) === normalizedRoot) {
+                    console.log(`[MiMoCode] ensureSession: reusing ${this._currentSessionId} (directory=${currentSession.directory})`);
                     return this._currentSessionId;
                 }
-            } else {
-                return this._currentSessionId;
+                // Current session doesn't match workspace — find or create
+                this._currentSessionId = undefined;
             }
+
+            // Find a session in the list that matches this workspace
+            const match = this._sessions.find(s => normalizePathForCompare(s.directory) === normalizedRoot);
+            if (match) {
+                this._currentSessionId = match.id;
+                console.log(`[MiMoCode] ensureSession: switched to ${match.id} (directory=${match.directory})`);
+                return match.id;
+            }
+
+            // No matching session — create a new one
+            const session = await this._apiClient.newSession({ directory: workspaceRoot });
+            this._currentSessionId = session.id;
+            console.log(`[MiMoCode] ensureSession: created ${session.id} for directory=${workspaceRoot}`);
+            await this.reloadSessions();
+            this._timeline.reset(session, []);
+            this.postTimeline();
+            return session.id;
         }
 
-        const session = await this._apiClient.newSession(workspaceRoot ? { directory: workspaceRoot } : undefined);
+        // No workspace root
+        if (this._currentSessionId) {
+            return this._currentSessionId;
+        }
+
+        // No workspace, no session — create one without directory
+        const session = await this._apiClient.newSession();
         this._currentSessionId = session.id;
         await this.reloadSessions();
         this._timeline.reset(session, []);
@@ -211,7 +243,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                     await this.initializeWebview();
                     break;
                 case 'sendPrompt':
-                    await this.handleSendPrompt(msg.text, msg.sessionId, msg.agent);
+                    await this.handleSendPrompt(msg.text, msg.agent);
                     break;
                 case 'abort':
                     await this.abort();
@@ -261,15 +293,20 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         }
     }
 
-    private async handleSendPrompt(text: string, sessionId?: string, agent?: string): Promise<void> {
+    private async handleSendPrompt(text: string, agent?: string): Promise<void> {
         const prompt = String(text || '').trim();
         if (!prompt) {
             return;
         }
 
         // Always go through ensureSession() so workspace directory is validated;
-        // do not trust the sessionId from the webview directly.
+        // do not trust any sessionId from the webview directly.
         const sid = await this.ensureSession();
+
+        const workspaceRoot = this._editorContext.getWorkspaceRoot();
+        const currentSession = this._sessions.find(s => s.id === sid);
+        console.log(`[MiMoCode] sendPrompt: workspaceRoot=${workspaceRoot}, sid=${sid}, session.directory=${currentSession?.directory}`);
+
         const context = this._editorContext.gatherContext();
         const promptOptions = this.getPromptOptions(agent);
         this._busy = true;
@@ -303,7 +340,20 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         }
         await this.reloadSessions();
         if (!this._currentSessionId && this._sessions.length > 0) {
-            await this.loadSession(this._sessions[0].id);
+            // When workspace exists, pick a matching session; otherwise fall back to first
+            const workspaceRoot = this._editorContext.getWorkspaceRoot();
+            if (workspaceRoot) {
+                const normalizedRoot = normalizePathForCompare(workspaceRoot);
+                const match = this._sessions.find(s => normalizePathForCompare(s.directory) === normalizedRoot);
+                if (match) {
+                    await this.loadSession(match.id);
+                } else {
+                    this._timeline.reset(undefined, []);
+                    this.postTimeline();
+                }
+            } else {
+                await this.loadSession(this._sessions[0].id);
+            }
         } else {
             this._timeline.reset(undefined, []);
             this.postTimeline();
@@ -462,4 +512,9 @@ function normalizeModelRef(model: string | undefined): string | undefined {
         return 'standard';
     }
     return trimmed;
+}
+
+function normalizePathForCompare(input?: string): string | undefined {
+    if (!input) return undefined;
+    return path.resolve(input);
 }

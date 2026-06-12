@@ -185,7 +185,7 @@
         "mimocode.server.port": {
           "type": "number",
           "default": 0,
-          "description": "MiMoCode HTTP服务器端口 (0=自动分配)"
+          "description": "MiMoCode HTTP服务器端口。0 表示每个 VS Code 窗口自动分配独立端口，避免多窗口串服务。"
         },
         "mimocode.server.autoStart": {
           "type": "boolean",

@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as crypto from 'crypto';
 import { ServerManager, ServerState } from './server/serverManager';
 import { ApiClient } from './api/client';
 import { SseClient } from './api/sseClient';
@@ -38,11 +39,14 @@ export async function activate(context: vscode.ExtensionContext) {
     configManager = new ConfigManager();
     const config = configManager.getConfig();
 
+    const instanceId = crypto.randomUUID();
+
     serverManager = new ServerManager({
         port: config.server.port,
         mimoPath: config.server.path,
         autoStart: config.server.autoStart,
-        cwd: getWorkspaceRootForServer()
+        cwd: getWorkspaceRootForServer(),
+        instanceId
     });
     apiClient = new ApiClient(() => serverManager.baseUrl);
     sseClient = new SseClient();
@@ -199,7 +203,8 @@ export async function activate(context: vscode.ExtensionContext) {
             port: newConfig.server.port,
             mimoPath: newConfig.server.path,
             autoStart: newConfig.server.autoStart,
-            cwd: getWorkspaceRootForServer()
+            cwd: getWorkspaceRootForServer(),
+            instanceId
         });
         void vscode.window.showInformationMessage('MiMoCode settings changed. Restart the MiMoCode server for port/path changes to apply.');
     });
