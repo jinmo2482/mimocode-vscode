@@ -38,6 +38,8 @@ export class ServerManager implements vscode.Disposable {
     private _cwd?: string;
     private _instanceId: string;
     private _ownsProcess = false;
+    private _stopPromise?: Promise<void>;
+    private _disposed = false;
     private _onStateChange = new vscode.EventEmitter<ServerState>();
     private _outputChannel: vscode.OutputChannel;
 
@@ -173,9 +175,15 @@ export class ServerManager implements vscode.Disposable {
             });
 
             this.process.on('exit', (code) => {
+                const wasOwned = this._ownsProcess;
                 this._outputChannel.appendLine(`Server exited with code ${code}`);
                 this.process = null;
                 this._ownsProcess = false;
+
+                if (wasOwned) {
+                    this.removeLockFile();
+                }
+
                 if (this._state !== ServerState.Stopped) {
                     this.setState(ServerState.Stopped);
                 }
@@ -208,50 +216,90 @@ export class ServerManager implements vscode.Disposable {
     }
 
     async stop(): Promise<void> {
-        if (!this.process) {
+        if (this._stopPromise) {
+            return this._stopPromise;
+        }
+
+        this._stopPromise = this.stopInternal().finally(() => {
+            this._stopPromise = undefined;
+        });
+
+        return this._stopPromise;
+    }
+
+    private async stopInternal(): Promise<void> {
+        const proc = this.process;
+
+        if (!proc) {
+            this.removeLockFile();
+            this._ownsProcess = false;
             this.setState(ServerState.Stopped);
             return;
         }
 
-        this._outputChannel.appendLine('Stopping MiMoCode server...');
-        return new Promise<void>((resolve) => {
-            const proc = this.process;
-            const timeout = setTimeout(() => {
-                proc?.kill('SIGKILL');
+        if (!this._ownsProcess) {
+            this._outputChannel.appendLine('Not stopping MiMoCode server because it is not owned by this VS Code window.');
+            this.process = null;
+            this.setState(ServerState.Stopped);
+            return;
+        }
+
+        this._outputChannel.appendLine(`Stopping owned MiMoCode server pid=${proc.pid} ...`);
+
+        await new Promise<void>((resolve) => {
+            let settled = false;
+
+            const done = () => {
+                if (settled) return;
+                settled = true;
                 resolve();
+            };
+
+            proc.once('exit', done);
+
+            try {
+                proc.kill('SIGTERM');
+            } catch {
+                done();
+                return;
+            }
+
+            setTimeout(() => {
+                if (!settled && proc.exitCode === null) {
+                    try {
+                        this._outputChannel.appendLine(`MiMoCode server did not exit after SIGTERM; sending SIGKILL pid=${proc.pid}`);
+                        proc.kill('SIGKILL');
+                    } catch {
+                        // ignore
+                    }
+                    setTimeout(done, 1000);
+                }
             }, 3000);
-
-            proc?.on('exit', () => {
-                clearTimeout(timeout);
-                this.process = null;
-                this._ownsProcess = false;
-                this.removeLockFile();
-                this.setState(ServerState.Stopped);
-                resolve();
-            });
-
-            proc?.kill('SIGTERM');
         });
+
+        this.process = null;
+        this._ownsProcess = false;
+        this.removeLockFile();
+        this.setState(ServerState.Stopped);
+        this._outputChannel.appendLine('Owned MiMoCode server stopped.');
     }
 
     /**
-     * Safely terminate a spawned server process.
+     * Safely terminate a spawned server process during start() failure cleanup.
      * Sends SIGTERM first, waits up to 3 seconds, then escalates to SIGKILL.
-     * Clears this.process on exit. Used only during start() failure cleanup;
-     * does not touch ServerState (caller is responsible).
+     * Does not touch ServerState (caller is responsible).
      */
     private killProcess(): Promise<void> {
         const proc = this.process;
         if (!proc) {
+            this.removeLockFile();
             return Promise.resolve();
         }
 
         return new Promise<void>((resolve) => {
             let settled = false;
             const done = () => {
-                if (settled) {
-                    return;
-                }
+                if (settled) return;
                 settled = true;
                 this.process = null;
                 this._ownsProcess = false;
@@ -261,14 +309,22 @@ export class ServerManager implements vscode.Disposable {
 
             proc.on('exit', done);
 
-            proc.kill('SIGTERM');
+            try {
+                proc.kill('SIGTERM');
+            } catch {
+                done();
+                return;
+            }
 
             setTimeout(() => {
                 if (!settled && proc.exitCode === null) {
-                    proc.kill('SIGKILL');
+                    try {
+                        proc.kill('SIGKILL');
+                    } catch {
+                        // ignore
+                    }
                 }
-                // Give SIGKILL a moment, then resolve regardless
-                setTimeout(done, 500);
+                setTimeout(done, 1000);
             }, 3000);
         });
     }
@@ -403,7 +459,7 @@ export class ServerManager implements vscode.Disposable {
     }
 
     dispose(): void {
-        void this.stop();
+        this._disposed = true;
         this._onStateChange.dispose();
         this._outputChannel.dispose();
     }

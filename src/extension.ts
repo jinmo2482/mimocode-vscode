@@ -82,8 +82,8 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    // serverManager is NOT in subscriptions — deactivate() handles its async stop.
     context.subscriptions.push(
-        serverManager,
         sseClient,
         diffManager,
         terminalBridge,
@@ -240,6 +240,22 @@ async function promptModelSelection(
     }
 }
 
-export function deactivate() {
-    void serverManager?.stop();
+export async function deactivate(): Promise<void> {
+    try {
+        sseClient?.disconnect();
+    } catch {
+        // ignore
+    }
+
+    try {
+        await serverManager?.stop();
+    } catch (err) {
+        console.error('[MiMoCode] Failed to stop server during deactivate:', err);
+    }
+
+    try {
+        serverManager?.dispose();
+    } catch {
+        // ignore
+    }
 }
