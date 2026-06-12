@@ -305,6 +305,7 @@ export interface PromptOptions {
     model?: { providerID: string; modelID: string };
     modelRef?: string;
     agent?: string;
+    variant?: string;
 }
 
 export interface ConfigInfo {
@@ -613,6 +614,29 @@ export class ApiClient {
             }
         }
         return models;
+    }
+
+    /**
+     * Get available variant names (reasoning effort levels) for a specific model.
+     * Returns empty array if the model has no variants defined.
+     */
+    getVariantsForModel(result: ProviderListResult, providerID: string, modelID: string): string[] {
+        for (const provider of result.all || []) {
+            const pid = provider.id || String((provider as any).providerID || provider.name);
+            if (pid !== providerID) continue;
+            const rawModels = provider.models || [];
+            const entries: [string, any][] = Array.isArray(rawModels)
+                ? rawModels.map(model => [model.id, model] as const)
+                : Object.entries(rawModels);
+            for (const [mid, model] of entries) {
+                if (mid !== modelID) continue;
+                if (model?.variants && typeof model.variants === 'object') {
+                    return Object.keys(model.variants);
+                }
+                return [];
+            }
+        }
+        return [];
     }
 
     private buildPromptParts(prompt: string, context?: ContextPayload): PromptTextPartInput[] {

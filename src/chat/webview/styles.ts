@@ -489,6 +489,41 @@ body {
   border-color: var(--vscode-button-background);
 }
 
+/* ── Control row (model + variant selects) ── */
+.control-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 6px;
+  align-items: center;
+}
+.control-label {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+.control-select {
+  font-size: 11px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  border: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-input-background);
+  color: var(--vscode-foreground);
+  max-width: 180px;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  outline: none;
+}
+.control-select:focus {
+  border-color: var(--vscode-focusBorder);
+}
+.control-select:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* ── Composer input ── */
 .composer-input-wrap {
   position: relative;

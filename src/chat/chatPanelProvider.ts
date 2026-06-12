@@ -17,6 +17,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     private _providers: unknown;
     private _currentModel?: string;
     private _effectiveModelRef?: string;
+    private _currentVariant?: string;
+    private _variantOptions: string[] = [];
+    private _models: Array<{ label: string; description?: string; providerID: string; modelID: string }> = [];
     private _timeline = new TimelineStore();
     private _disposables: vscode.Disposable[] = [];
     private _busy = false;
@@ -156,6 +159,41 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         this._providers = providers;
         this._currentModel = typeof config.model === 'string' ? config.model : undefined;
         this._effectiveModelRef = normalizeModelRef(this._currentModel);
+
+        // Compute models list and variant options
+        if (providers) {
+            this._models = this._apiClient.normalizeModels(providers);
+            // Sort: connected provider models first
+            const connected = new Set(providers.connected || []);
+            this._models.sort((a, b) => {
+                const aConn = connected.has(a.providerID) ? 0 : 1;
+                const bConn = connected.has(b.providerID) ? 0 : 1;
+                return aConn - bConn;
+            });
+            // Update variant options for current model
+            this.updateVariantOptions();
+        } else {
+            this._models = [];
+            this._variantOptions = [];
+        }
+    }
+
+    /**
+     * Update variant options based on the current model.
+     * Variant names come from the provider model info (e.g. "low", "medium", "high").
+     */
+    private updateVariantOptions(): void {
+        if (!this._providers || !this._currentModel) {
+            this._variantOptions = [];
+            return;
+        }
+        const [providerID, ...rest] = this._currentModel.split('/');
+        const modelID = rest.join('/');
+        this._variantOptions = this._apiClient.getVariantsForModel(this._providers, providerID, modelID);
+        // If current variant is not in the new options, clear it
+        if (this._currentVariant && !this._variantOptions.includes(this._currentVariant)) {
+            this._currentVariant = undefined;
+        }
     }
 
     /**
@@ -312,6 +350,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                         toolCallId: msg.toolCallId,
                         requestID: msg.requestID
                     });
+                    break;
+                case 'setModel':
+                    await this.handleSetModel(msg.model);
+                    break;
+                case 'setVariant':
+                    await this.handleSetVariant(msg.variant);
                     break;
             }
         } catch (err) {
@@ -502,6 +546,61 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         return undefined;
     }
 
+    /**
+     * Public: set the current model. Called from webview or command palette.
+     */
+    async setModel(modelRef: string): Promise<void> {
+        if (!modelRef) return;
+        try {
+            await this._apiClient.setModel(modelRef);
+            await this.loadConfigAndProviders();
+            this.postShellState();
+            console.log(`[MiMoCode] Model set to ${modelRef}`);
+        } catch (err) {
+            const msg = toMessage(err);
+            const hint = /insufficient|balance|not supported|param incorrect/i.test(msg)
+                ? ' Please switch model or check provider account balance.'
+                : '';
+            this.showError(`Failed to set model: ${msg}${hint}`);
+        }
+    }
+
+    /**
+     * Public: set the current variant (reasoning effort). Called from webview or command palette.
+     */
+    async setVariant(variant: string | undefined): Promise<void> {
+        this._currentVariant = variant || undefined;
+        this.postShellState();
+        console.log(`[MiMoCode] Variant set to ${variant || 'default'}`);
+    }
+
+    /**
+     * Public: get current variant options for the command palette.
+     */
+    getVariantOptions(): string[] {
+        return [...this._variantOptions];
+    }
+
+    /**
+     * Public: get current models list for the command palette.
+     */
+    getModels(): Array<{ label: string; description?: string; providerID: string; modelID: string }> {
+        return [...this._models];
+    }
+
+    private async handleSetModel(modelRef: string): Promise<void> {
+        await this.setModel(modelRef);
+    }
+
+    private async handleSetVariant(variant: string): Promise<void> {
+        // Validate variant is in allowed list (empty string means default/no variant)
+        if (variant && this._variantOptions.length > 0 && !this._variantOptions.includes(variant)) {
+            this.showError(`Invalid variant "${variant}". Allowed: ${this._variantOptions.join(', ')}`);
+            return;
+        }
+        await this.setVariant(variant || undefined);
+    }
+
     private async refreshStatus(): Promise<void> {
         if (!this._currentSessionId) {
             return;
@@ -588,7 +687,10 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             providers: this._providers,
             sseState: this._sseClient.state,
             busy: this._busy,
-            model: this._effectiveModelRef || this._currentModel
+            model: this._effectiveModelRef || this._currentModel,
+            models: this._models,
+            variant: this._currentVariant,
+            variantOptions: this._variantOptions
         });
     }
 
@@ -596,6 +698,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         const opts: PromptOptions = {};
         if (this._effectiveModelRef) {
             opts.modelRef = this._effectiveModelRef;
+        }
+        if (this._currentVariant) {
+            opts.variant = this._currentVariant;
         }
         if (agent) {
             opts.agent = agent;

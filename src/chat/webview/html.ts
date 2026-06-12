@@ -43,6 +43,14 @@ export function getHtml(webview: vscode.Webview): string {
             <button class="agent-pill" data-agent="plan">plan</button>
             <button class="agent-pill" data-agent="compose">compose</button>
         </div>
+        <div class="control-row" id="control-row">
+            <label class="control-label">Model
+                <select id="model-select" class="control-select"></select>
+            </label>
+            <label class="control-label">Reasoning
+                <select id="variant-select" class="control-select"></select>
+            </label>
+        </div>
         <div class="composer-input-wrap">
             <textarea id="prompt" placeholder="Ask MiMoCode... (@ to mention)" rows="1"></textarea>
             <div class="composer-actions">

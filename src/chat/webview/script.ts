@@ -1,7 +1,7 @@
 export function getScript(): string {
     return String.raw`
 var vscode = acquireVsCodeApi();
-var state = { sessions: [], currentSessionId: null, busy: false, sseState: 'disconnected', model: undefined, agentMode: 'build' };
+var state = { sessions: [], currentSessionId: null, busy: false, sseState: 'disconnected', model: undefined, agentMode: 'build', models: [], variant: undefined, variantOptions: [] };
 var timeline = { messages: [], diffs: [], errors: [] };
 
 var els = {
@@ -17,7 +17,9 @@ var els = {
   abort: document.getElementById('abort'),
   loginScreen: document.getElementById('login-screen'),
   signInBtn: document.getElementById('sign-in-btn'),
-  agentBar: document.getElementById('agent-bar')
+  agentBar: document.getElementById('agent-bar'),
+  modelSelect: document.getElementById('model-select'),
+  variantSelect: document.getElementById('variant-select')
 };
 
 /* ── Auto-grow textarea ── */
@@ -38,6 +40,16 @@ els.agentBar.addEventListener('click', function(e) {
   for (var i = 0; i < pills.length; i++) {
     pills[i].classList.toggle('active', pills[i].getAttribute('data-agent') === mode);
   }
+});
+
+/* ── Model / variant selectors ── */
+els.modelSelect.addEventListener('change', function() {
+  var val = els.modelSelect.value;
+  if (val) vscode.postMessage({ type: 'setModel', model: val });
+});
+els.variantSelect.addEventListener('change', function() {
+  var val = els.variantSelect.value;
+  vscode.postMessage({ type: 'setVariant', variant: val });
 });
 
 /* ── Message handling ── */
@@ -235,6 +247,65 @@ function renderShell() {
 
   var statusLabel = timeline.status && (timeline.status.message || timeline.status.type) || (state.busy ? 'running' : 'idle');
   els.meta.innerHTML = chip(statusLabel) + chip(state.model || 'default');
+
+  renderControls();
+}
+
+/* ── Model / variant select render ── */
+function renderControls() {
+  // Model select
+  var models = state.models || [];
+  var currentModel = state.model || '';
+  els.modelSelect.innerHTML = '';
+  if (models.length === 0) {
+    var opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = currentModel || 'No model';
+    opt.disabled = true;
+    els.modelSelect.appendChild(opt);
+    els.modelSelect.disabled = true;
+  } else {
+    // Ensure current model is in the list
+    var found = false;
+    for (var i = 0; i < models.length; i++) {
+      var m = models[i];
+      var o = document.createElement('option');
+      o.value = m.label;
+      o.textContent = m.label;
+      if (m.label === currentModel) { o.selected = true; found = true; }
+      els.modelSelect.appendChild(o);
+    }
+    if (!found && currentModel) {
+      var o2 = document.createElement('option');
+      o2.value = currentModel;
+      o2.textContent = currentModel;
+      o2.selected = true;
+      els.modelSelect.insertBefore(o2, els.modelSelect.firstChild);
+    }
+    els.modelSelect.disabled = !!state.busy;
+  }
+
+  // Variant select
+  var variants = state.variantOptions || [];
+  var currentVariant = state.variant || '';
+  els.variantSelect.innerHTML = '';
+  // Always include a "default" option
+  var defOpt = document.createElement('option');
+  defOpt.value = '';
+  defOpt.textContent = 'default';
+  els.variantSelect.appendChild(defOpt);
+  for (var j = 0; j < variants.length; j++) {
+    var vo = document.createElement('option');
+    vo.value = variants[j];
+    vo.textContent = variants[j];
+    if (variants[j] === currentVariant) vo.selected = true;
+    els.variantSelect.appendChild(vo);
+  }
+  if (variants.length === 0) {
+    els.variantSelect.disabled = true;
+  } else {
+    els.variantSelect.disabled = !!state.busy;
+  }
 }
 
 /* ── Timeline render ── */

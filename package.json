@@ -102,6 +102,11 @@
         "category": "MiMoCode"
       },
       {
+        "command": "mimocode.setVariant",
+        "title": "Set Reasoning Effort",
+        "category": "MiMoCode"
+      },
+      {
         "command": "mimocode.switchSession",
         "title": "Switch Session",
         "category": "MiMoCode"
@@ -199,7 +204,7 @@
         },
         "mimocode.model": {
           "type": "string",
-          "description": "默认模型"
+          "description": "默认模型，例如 provider/model"
         },
         "mimocode.mode": {
           "type": "string",
