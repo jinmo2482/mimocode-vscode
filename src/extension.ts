@@ -63,7 +63,7 @@ export async function activate(context: vscode.ExtensionContext) {
         mentionProvider,
         diffManager
     );
-    sessionTreeProvider = new SessionTreeProvider(apiClient);
+    sessionTreeProvider = new SessionTreeProvider(apiClient, getWorkspaceRootForServer);
     providerAuthController = new ProviderAuthController(apiClient);
 
     // Wire webview sign-in button to the auth controller

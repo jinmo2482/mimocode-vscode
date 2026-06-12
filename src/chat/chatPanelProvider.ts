@@ -172,6 +172,17 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
 
     private async loadSession(sessionId: string): Promise<void> {
         try {
+            // Guard: prevent loading a session from another workspace
+            const workspaceRoot = this._editorContext.getWorkspaceRoot();
+            if (workspaceRoot) {
+                const session = await this._apiClient.getSession(sessionId);
+                const normalizedRoot = normalizePathForCompare(workspaceRoot);
+                if (normalizePathForCompare(session.directory) !== normalizedRoot) {
+                    this.showError('Cannot switch to a session from another workspace.');
+                    return;
+                }
+            }
+
             this._currentSessionId = sessionId;
             const [session, messages, statuses] = await Promise.all([
                 this._apiClient.getSession(sessionId),
@@ -214,12 +225,20 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
 
             // No matching session — create a new one
             const session = await this._apiClient.newSession({ directory: workspaceRoot });
-            this._currentSessionId = session.id;
-            console.log(`[MiMoCode] ensureSession: created ${session.id} for directory=${workspaceRoot}`);
+            // Verify the server actually used the requested directory
+            const created = await this._apiClient.getSession(session.id);
+            if (normalizePathForCompare(created.directory) !== normalizedRoot) {
+                console.warn(
+                    `[MiMoCode] Server ignored requested session directory. ` +
+                    `requested: ${workspaceRoot}, actual: ${created.directory}`
+                );
+            }
+            this._currentSessionId = created.id;
+            console.log(`[MiMoCode] ensureSession: created ${created.id} for directory=${workspaceRoot}`);
             await this.reloadSessions();
-            this._timeline.reset(session, []);
+            this._timeline.reset(created, []);
             this.postTimeline();
-            return session.id;
+            return created.id;
         }
 
         // No workspace root
