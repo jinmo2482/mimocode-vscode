@@ -393,7 +393,7 @@ function renderQuestionTool(part) {
           var opt = options[oi];
           var optLabel = typeof opt === 'string' ? opt : (opt.label || opt.value || '');
           var optDesc = typeof opt === 'object' ? (opt.description || opt.hint || '') : '';
-          var optValue = typeof opt === 'object' ? (opt.value || opt.label || '') : opt;
+          var optValue = typeof opt === 'object' ? (opt.label || opt.value || '') : opt;
           chunks.push('<button class="question-opt-btn" data-action="answerQuestion" data-answer="' + escapeAttr(optValue) + '" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '">' + escapeHtml(optLabel) + (optDesc ? '<span class="question-opt-desc">' + escapeHtml(optDesc) + '</span>' : '') + '</button>');
         }
         chunks.push('</div>');

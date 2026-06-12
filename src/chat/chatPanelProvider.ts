@@ -514,15 +514,26 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         // Handle question events regardless of session filter
         if (event.type === 'question.asked') {
             const requestID = event.properties?.id as string | undefined;
-            const callID = event.properties?.tool?.callID as string | undefined;
+            // Defensive: callID may be in different locations depending on server version
+            const callID =
+                (event.properties?.tool?.callID as string | undefined) ||
+                (event.properties?.callID as string | undefined) ||
+                (event.properties?.part?.callID as string | undefined) ||
+                (event.properties?.toolCallId as string | undefined) ||
+                (event.properties?.toolCallID as string | undefined);
+            console.log('[MiMoCode] question.asked properties', event.properties);
             if (requestID && callID) {
                 this._pendingQuestions.set(callID, requestID);
                 console.log('[MiMoCode] question.asked captured', { requestID, callID });
+            } else {
+                console.warn('[MiMoCode] question.asked missing requestID or callID', { requestID, callID });
             }
             return;
         }
         if (event.type === 'question.replied' || event.type === 'question.rejected') {
-            const requestID = event.properties?.requestID as string | undefined;
+            const requestID =
+                (event.properties?.requestID as string | undefined) ||
+                (event.properties?.id as string | undefined);
             if (requestID) {
                 // Remove from pending map
                 for (const [callID, rid] of this._pendingQuestions.entries()) {
