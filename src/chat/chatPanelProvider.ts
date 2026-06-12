@@ -267,7 +267,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             return;
         }
 
-        const sid = sessionId || await this.ensureSession();
+        // Always go through ensureSession() so workspace directory is validated;
+        // do not trust the sessionId from the webview directly.
+        const sid = await this.ensureSession();
         const context = this._editorContext.gatherContext();
         const promptOptions = this.getPromptOptions(agent);
         this._busy = true;
