@@ -61,6 +61,12 @@ window.addEventListener('message', function(event) {
       break;
     case 'mentionContent':
       break;
+    case 'timelinePatch':
+      // No-op: the webview currently relies on timelineSnapshot (full re-render)
+      // for all timeline updates. Patch-based incremental DOM updates are not yet
+      // implemented. This case exists so the message is explicitly handled rather
+      // than silently falling through to the default branch.
+      break;
     case 'error':
       console.error(msg.message);
       break;
@@ -486,14 +492,38 @@ function escapeHtml(value) {
 }
 function escapeAttr(value) { return escapeHtml(value).replace(/'/g, '&#39;'); }
 function renderMarkdown(text) {
-  var html = escapeHtml(text);
+  // Extract fenced code blocks and inline code BEFORE HTML escaping,
+  // so their content is preserved and not broken by \n→<br>.
+  // The webview currently relies on timelineSnapshot full re-render;
+  // patch-based DOM is not implemented.
+  var codeBlocks = [];
+  var inlineCodes = [];
   var tick = String.fromCharCode(96);
-  html = html.replace(new RegExp(tick + tick + tick + '([a-zA-Z]*)\\n([\\s\\S]*?)' + tick + tick + tick, 'g'), function(_, lang, code) {
-    return '<pre><code>' + code + '</code></pre>';
+
+  // Fenced code blocks: escape content, store for later restoration
+  var html = text.replace(new RegExp(tick + tick + tick + '([a-zA-Z]*)\\n([\\s\\S]*?)' + tick + tick + tick, 'g'), function(_, lang, code) {
+    var cls = lang ? ' class="language-' + lang + '"' : '';
+    codeBlocks.push('<pre><code' + cls + '>' + escapeHtml(code) + '</code></pre>');
+    return '%%CODEBLOCK_' + (codeBlocks.length - 1) + '%%';
   });
-  html = html.replace(new RegExp(tick + '([^' + tick + ']+)' + tick, 'g'), '<code>$1</code>');
+
+  // Inline code
+  html = html.replace(new RegExp(tick + '([^' + tick + ']+)' + tick, 'g'), function(_, code) {
+    inlineCodes.push('<code>' + escapeHtml(code) + '</code>');
+    return '%%INLINECODE_' + (inlineCodes.length - 1) + '%%';
+  });
+
+  // HTML-escape the rest
+  html = escapeHtml(html);
+
+  // Inline formatting (asterisks are not HTML-escaped, match them directly)
   html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/\n/g, '<br>');
+
+  // Restore code blocks and inline code (already HTML-escaped, not re-escaped)
+  html = html.replace(/%%CODEBLOCK_(\d+)%%/g, function(_, i) { return codeBlocks[parseInt(i)]; });
+  html = html.replace(/%%INLINECODE_(\d+)%%/g, function(_, i) { return inlineCodes[parseInt(i)]; });
+
   return html;
 }
 

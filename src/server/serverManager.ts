@@ -130,6 +130,7 @@ export class ServerManager implements vscode.Disposable {
         } catch (err) {
             this._outputChannel.appendLine(`Failed to start server: ${err}`);
             this._outputChannel.appendLine('Tip: Open the "MiMoCode Server" output channel (View → Output → MiMoCode Server) to see server logs.');
+            await this.killProcess();
             this.setState(ServerState.Error);
             throw err;
         }
@@ -157,6 +158,43 @@ export class ServerManager implements vscode.Disposable {
             });
 
             proc?.kill('SIGTERM');
+        });
+    }
+
+    /**
+     * Safely terminate a spawned server process.
+     * Sends SIGTERM first, waits up to 3 seconds, then escalates to SIGKILL.
+     * Clears this.process on exit. Used only during start() failure cleanup;
+     * does not touch ServerState (caller is responsible).
+     */
+    private killProcess(): Promise<void> {
+        const proc = this.process;
+        if (!proc) {
+            return Promise.resolve();
+        }
+
+        return new Promise<void>((resolve) => {
+            let settled = false;
+            const done = () => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                this.process = null;
+                resolve();
+            };
+
+            proc.on('exit', done);
+
+            proc.kill('SIGTERM');
+
+            setTimeout(() => {
+                if (!settled && proc.exitCode === null) {
+                    proc.kill('SIGKILL');
+                }
+                // Give SIGKILL a moment, then resolve regardless
+                setTimeout(done, 500);
+            }, 3000);
         });
     }
 
