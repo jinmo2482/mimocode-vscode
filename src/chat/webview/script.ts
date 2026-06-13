@@ -3,6 +3,8 @@ export function getScript(): string {
 var vscode = acquireVsCodeApi();
 var state = { sessions: [], currentSessionId: null, busy: false, sseState: 'disconnected', model: undefined, agentMode: 'build', models: [], variant: undefined, variantOptions: [] };
 var timeline = { messages: [], diffs: [], errors: [] };
+// Track staged answers for multi-question requests: cardId -> answer[]
+var questionSelections = {};
 
 var els = {
   statusDot: document.getElementById('status-dot'),
@@ -115,68 +117,97 @@ els.timeline.addEventListener('click', function(event) {
   var action = button.getAttribute('data-action');
   if (!action) return;
 
-  // Handle question tool option clicks
+  // Handle question option selection (staged for multi-question, immediate for single)
   if (action === 'answerQuestion') {
-    var qAnswer = button.getAttribute('data-answer') || '';
-    var qToolCallId = button.getAttribute('data-tool-call-id') || '';
-    var qMessageId = button.getAttribute('data-message-id') || '';
-    var qSessionId = button.getAttribute('data-session-id') || '';
-    var qRequestId = button.getAttribute('data-request-id') || '';
-    console.log('[MiMoCode Webview] answerQuestion clicked', {
-      answer: qAnswer,
-      toolCallId: qToolCallId,
-      messageId: qMessageId,
-      sessionId: qSessionId,
-      requestID: qRequestId
-    });
-    // Disable all option buttons in this card and show sent state
     var qCard = button.closest('.question-card');
-    if (qCard) {
+    if (!qCard) return;
+    var isSingle = qCard.getAttribute('data-single') === '1';
+    var qIdx = parseInt(button.getAttribute('data-q-index') || '0', 10);
+    var qAnswer = button.getAttribute('data-answer') || '';
+    var cardId = qCard.getAttribute('data-card-id') || '';
+
+    if (isSingle) {
+      // Single question: submit immediately
       var allBtns = qCard.querySelectorAll('.question-opt-btn');
       for (var bi = 0; bi < allBtns.length; bi++) {
         allBtns[bi].disabled = true;
         allBtns[bi].classList.add('question-opt-disabled');
       }
       button.classList.add('question-opt-selected');
-      button.textContent = button.textContent + ' ✓';
+      submitQuestionAnswers(qCard, [[qAnswer]]);
+      return;
     }
-    vscode.postMessage({
-      type: 'answerQuestion',
-      answer: qAnswer,
-      toolCallId: qToolCallId,
-      messageId: qMessageId,
-      sessionId: qSessionId,
-      requestID: qRequestId
-    });
+
+    // Multi-question: toggle selection for this question index
+    if (!questionSelections[cardId]) questionSelections[cardId] = [];
+    if (!questionSelections[cardId][qIdx]) questionSelections[cardId][qIdx] = [];
+
+    var sel = questionSelections[cardId][qIdx];
+    var pos = sel.indexOf(qAnswer);
+    if (pos >= 0) {
+      sel.splice(pos, 1);
+      button.classList.remove('question-opt-selected');
+    } else {
+      // For non-multiple questions, clear previous selection in this group
+      var qGroup = qCard.querySelectorAll('[data-q-index="' + qIdx + '"]');
+      for (var gi = 0; gi < qGroup.length; gi++) {
+        qGroup[gi].classList.remove('question-opt-selected');
+      }
+      questionSelections[cardId][qIdx] = [qAnswer];
+      button.classList.add('question-opt-selected');
+    }
+    updateConfirmButton(qCard);
     return;
   }
-  // Handle question tool text input submit
+
+  // Handle question text input (for custom answers)
   if (action === 'answerQuestionInput') {
     var qCard2 = button.closest('.question-card');
     var inputEl = qCard2 ? qCard2.querySelector('.question-input') : null;
     var textAnswer = inputEl ? inputEl.value.trim() : '';
     if (!textAnswer) return;
-    var qToolCallId2 = button.getAttribute('data-tool-call-id') || '';
-    var qMessageId2 = button.getAttribute('data-message-id') || '';
-    var qSessionId2 = button.getAttribute('data-session-id') || '';
-    var qRequestId2 = button.getAttribute('data-request-id') || '';
-    console.log('[MiMoCode Webview] answerQuestionInput submitted', {
-      answer: textAnswer,
-      toolCallId: qToolCallId2,
-      requestID: qRequestId2
-    });
-    // Disable input and button
+    var isSingle2 = qCard2 && qCard2.getAttribute('data-single') === '1';
+    var cardId2 = qCard2 ? qCard2.getAttribute('data-card-id') || '' : '';
+
+    if (isSingle2) {
+      if (inputEl) inputEl.disabled = true;
+      button.disabled = true;
+      submitQuestionAnswers(qCard2, [[textAnswer]]);
+      return;
+    }
+
+    // Multi-question: set text answer for the corresponding question index
+    var qIdx2 = parseInt(inputEl ? inputEl.getAttribute('data-q-index') || '0' : '0', 10);
+    if (!questionSelections[cardId2]) questionSelections[cardId2] = [];
+    questionSelections[cardId2][qIdx2] = [textAnswer];
     if (inputEl) inputEl.disabled = true;
     button.disabled = true;
-    button.textContent = 'Sent ✓';
-    vscode.postMessage({
-      type: 'answerQuestion',
-      answer: textAnswer,
-      toolCallId: qToolCallId2,
-      messageId: qMessageId2,
-      sessionId: qSessionId2,
-      requestID: qRequestId2
-    });
+    button.textContent = 'Set ✓';
+    updateConfirmButton(qCard2);
+    return;
+  }
+
+  // Handle confirm button for multi-question
+  if (action === 'confirmQuestions') {
+    var qCard3 = button.closest('.question-card');
+    if (!qCard3) return;
+    var cardId3 = qCard3.getAttribute('data-card-id') || '';
+    var answers = questionSelections[cardId3] || [];
+    // Disable all buttons
+    var allBtns3 = qCard3.querySelectorAll('.question-opt-btn, .question-input, .question-submit-btn, .question-confirm-btn');
+    for (var bi3 = 0; bi3 < allBtns3.length; bi3++) {
+      allBtns3[bi3].disabled = true;
+    }
+    submitQuestionAnswers(qCard3, answers);
+    return;
+  }
+
+  // Handle open plan file
+  if (action === 'openPlanFile') {
+    var planPath = button.getAttribute('data-plan-path') || '';
+    if (planPath) {
+      vscode.postMessage({ type: 'openPlanFile', path: planPath });
+    }
     return;
   }
 
@@ -608,14 +639,38 @@ function renderQuestionTool(part) {
     '</div>';
   }
 
+  // Detect plan_exit
+  var isPlanExit = false;
+  var planPath = '';
+  for (var pqi = 0; pqi < questions.length; pqi++) {
+    if (questions[pqi].key === 'plan_exit') {
+      isPlanExit = true;
+      planPath = (questions[pqi].params && questions[pqi].params.plan) || '';
+      break;
+    }
+  }
+
+  // Single question (not multi-select) → immediate submit on click
+  var isSingle = questions.length === 1 && !questions[0].multiple;
+  // Unique card ID for tracking multi-question state
+  var cardId = toolCallId || ('q_' + (part.id || ''));
+
   // Pending questions: full interactive card
   var chunks = [];
-  chunks.push('<div class="card question-card">');
+  chunks.push('<div class="card question-card" data-card-id="' + escapeAttr(cardId) + '" data-single="' + (isSingle ? '1' : '0') + '" data-total-questions="' + questions.length + '" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '">');
   chunks.push('<div class="card-row">');
-  chunks.push('<span class="card-icon">&#x2753;</span>');
-  chunks.push('<span class="card-title">Question</span>');
+  chunks.push('<span class="card-icon">' + (isPlanExit ? '&#x1F4CB;' : '&#x2753;') + '</span>');
+  chunks.push('<span class="card-title">' + (isPlanExit ? 'Plan' : 'Question') + '</span>');
   chunks.push('<span class="card-badge pending">pending</span>');
   chunks.push('</div>');
+
+  // Show plan path for plan_exit
+  if (isPlanExit && planPath) {
+    chunks.push('<div class="question-header">Plan complete: ' + escapeHtml(planPath) + '</div>');
+    chunks.push('<div class="question-options">');
+    chunks.push('<button class="question-opt-btn" data-action="openPlanFile" data-plan-path="' + escapeAttr(planPath) + '">&#x1F4C2; Open Plan</button>');
+    chunks.push('</div>');
+  }
 
   for (var qi = 0; qi < questions.length; qi++) {
     var q = questions[qi];
@@ -623,29 +678,38 @@ function renderQuestionTool(part) {
     var questionText = q.question || '';
     var options = q.options || [];
 
-    if (qheader) {
+    // Skip the header for plan_exit since we already showed the plan path
+    if (qheader && !(isPlanExit && q.key === 'plan_exit')) {
       chunks.push('<div class="question-header">' + escapeHtml(qheader) + '</div>');
     }
-    if (questionText) {
+    if (questionText && !(isPlanExit && q.key === 'plan_exit')) {
       chunks.push('<div class="question-text">' + escapeHtml(questionText) + '</div>');
     }
 
     if (options.length > 0) {
-      chunks.push('<div class="question-options">');
+      chunks.push('<div class="question-options" data-q-index="' + qi + '">');
       for (var oi = 0; oi < options.length; oi++) {
         var opt = options[oi];
         var optLabel = typeof opt === 'string' ? opt : (opt.label || opt.value || '');
         var optDesc = typeof opt === 'object' ? (opt.description || opt.hint || '') : '';
         var optValue = typeof opt === 'object' ? (opt.label || opt.value || '') : opt;
-        chunks.push('<button class="question-opt-btn" data-action="answerQuestion" data-answer="' + escapeAttr(optValue) + '" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '">' + escapeHtml(optLabel) + (optDesc ? '<span class="question-opt-desc">' + escapeHtml(optDesc) + '</span>' : '') + '</button>');
+        chunks.push('<button class="question-opt-btn" data-action="answerQuestion" data-answer="' + escapeAttr(optValue) + '" data-q-index="' + qi + '">' + escapeHtml(optLabel) + (optDesc ? '<span class="question-opt-desc">' + escapeHtml(optDesc) + '</span>' : '') + '</button>');
       }
       chunks.push('</div>');
-    } else {
+    } else if (q.custom !== false) {
+      // Free-text input (custom defaults to true)
       chunks.push('<div class="question-text-input">');
-      chunks.push('<input type="text" class="question-input" placeholder="Type your answer..." data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '" />');
-      chunks.push('<button class="question-submit-btn" data-action="answerQuestionInput" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '">Submit</button>');
+      chunks.push('<input type="text" class="question-input" placeholder="Type your answer..." data-q-index="' + qi + '" />');
+      chunks.push('<button class="question-submit-btn" data-action="answerQuestionInput">Submit</button>');
       chunks.push('</div>');
     }
+  }
+
+  // Confirm button for multi-question
+  if (!isSingle) {
+    chunks.push('<div class="question-options">');
+    chunks.push('<button class="question-confirm-btn" data-action="confirmQuestions" disabled>Confirm (0/' + questions.length + ')</button>');
+    chunks.push('</div>');
   }
 
   chunks.push('</div>');
@@ -913,6 +977,39 @@ function currentMentionQuery() {
   var before = els.prompt.value.slice(0, pos);
   var match = before.match(/(?:^|\s)@([^\s@]*)$/);
   return match ? match[1] : null;
+}
+
+/* ── Question answer helpers ── */
+function submitQuestionAnswers(qCard, answers) {
+  var toolCallId = qCard.getAttribute('data-tool-call-id') || '';
+  var messageId = qCard.getAttribute('data-message-id') || '';
+  var sessionId = qCard.getAttribute('data-session-id') || '';
+  var requestID = qCard.getAttribute('data-request-id') || '';
+  var cardId = qCard.getAttribute('data-card-id') || '';
+  // Clean up state
+  delete questionSelections[cardId];
+  vscode.postMessage({
+    type: 'answerQuestion',
+    answers: answers,
+    toolCallId: toolCallId,
+    messageId: messageId,
+    sessionId: sessionId,
+    requestID: requestID
+  });
+}
+
+function updateConfirmButton(qCard) {
+  var btn = qCard.querySelector('.question-confirm-btn');
+  if (!btn) return;
+  var totalQ = parseInt(qCard.getAttribute('data-total-questions') || '1', 10);
+  var cardId = qCard.getAttribute('data-card-id') || '';
+  var sel = questionSelections[cardId] || [];
+  var answered = 0;
+  for (var i = 0; i < totalQ; i++) {
+    if (sel[i] && sel[i].length > 0) answered++;
+  }
+  btn.disabled = answered < totalQ;
+  btn.textContent = 'Confirm (' + answered + '/' + totalQ + ')';
 }
 
 /* ── Helpers ── */

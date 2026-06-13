@@ -365,11 +365,15 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                 case 'answerQuestion':
                     await this.handleAnswerQuestion({
                         answer: msg.answer,
+                        answers: msg.answers,
                         sessionId: msg.sessionId,
                         messageId: msg.messageId,
                         toolCallId: msg.toolCallId,
                         requestID: msg.requestID
                     });
+                    break;
+                case 'openPlanFile':
+                    await this.handleOpenPlanFile(msg.path);
                     break;
                 case 'setModel':
                     await this.handleSetModel(msg.model);
@@ -488,13 +492,19 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     }
 
     private async handleAnswerQuestion(payload: {
-        answer: string;
+        answer?: string;
+        answers?: string[][];
         sessionId?: string;
         messageId?: string;
         toolCallId?: string;
         requestID?: string;
     }): Promise<void> {
-        if (!payload.answer) {
+        // Build answers array: prefer payload.answers, fall back to [[payload.answer]]
+        let answers: string[][] | undefined = payload.answers;
+        if (!answers && payload.answer) {
+            answers = [[payload.answer]];
+        }
+        if (!answers || answers.length === 0) {
             return;
         }
 
@@ -511,22 +521,49 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
 
         if (requestID) {
             try {
-                await this._apiClient.answerQuestion(requestID, [[payload.answer]]);
+                await this._apiClient.answerQuestion(requestID, answers);
                 // Clean up pending map
                 if (payload.toolCallId && sid) {
                     this._pendingQuestions.delete(`${sid}:${payload.toolCallId}`);
                 }
                 return;
             } catch {
-                // Fall through to appendTuiPrompt
+                // Fall through to appendTuiPrompt only for single-answer
             }
         }
 
-        // Fallback: appendTuiPrompt
+        // Fallback: appendTuiPrompt (only for single answer)
+        if (answers.length === 1 && answers[0].length === 1) {
+            try {
+                await this._apiClient.appendTuiPrompt(answers[0][0] + '\n');
+            } catch {
+                this.showError('Failed to answer MiMoCode question. The headless question answer protocol may be unsupported.');
+            }
+        }
+    }
+
+    /**
+     * Open a plan file in the VS Code editor.
+     * Resolves relative paths against the workspace root.
+     */
+    private async handleOpenPlanFile(planPath: string): Promise<void> {
+        if (!planPath) return;
         try {
-            await this._apiClient.appendTuiPrompt(payload.answer + '\n');
-        } catch {
-            this.showError('Failed to answer MiMoCode question. The headless question answer protocol may be unsupported.');
+            let uri: vscode.Uri;
+            if (path.isAbsolute(planPath)) {
+                uri = vscode.Uri.file(planPath);
+            } else {
+                // Try workspace root first
+                const workspaceRoot = this._editorContext.getWorkspaceRoot();
+                if (workspaceRoot) {
+                    uri = vscode.Uri.file(path.join(workspaceRoot, planPath));
+                } else {
+                    uri = vscode.Uri.file(planPath);
+                }
+            }
+            await vscode.window.showTextDocument(uri);
+        } catch (err) {
+            this.showError(`Failed to open plan file: ${planPath} — ${toMessage(err)}`);
         }
     }
 

@@ -696,6 +696,28 @@ body {
   line-height: 1.4;
 }
 .question-submit-btn:hover { background: var(--vscode-button-hoverBackground); }
+.question-confirm-btn {
+  font-size: 11px;
+  padding: 3px 12px;
+  border-radius: 3px;
+  border: none;
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  cursor: pointer;
+  line-height: 1.4;
+  font-weight: 500;
+}
+.question-confirm-btn:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+.question-confirm-btn:disabled { opacity: 0.4; cursor: default; }
+.question-opt-selected {
+  background: var(--vscode-button-background) !important;
+  color: var(--vscode-button-foreground) !important;
+  border-color: var(--vscode-button-background) !important;
+}
+.question-opt-disabled {
+  opacity: 0.5;
+  cursor: default !important;
+}
 
 /* ── Reasoning summary (collapsed Thought line) ── */
 .reasoning-summary {
