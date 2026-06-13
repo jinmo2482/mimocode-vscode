@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { ApiClient, ApiError, ConfigInfo, PromptOptions, SessionInfo, SessionStatusInfo } from '../api/client';
+import { ApiClient, ApiError, ConfigInfo, PromptOptions, SessionInfo, SessionStatusInfo, generateMessageID } from '../api/client';
 import { SseClient, SseEvent } from '../api/sseClient';
 import { EditorContext } from '../context/editorContext';
 import { MentionProvider } from '../context/mentionProvider';
@@ -404,6 +404,10 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         const context = this._editorContext.gatherContext();
         const promptOptions = this.getPromptOptions(agent);
 
+        // Generate messageID client-side (same format as TUI MessageID.ascending).
+        // This lets the server associate the user message with a known ID.
+        promptOptions.messageID = generateMessageID();
+
         // CLI/TUI-aligned async flow:
         // POST /prompt_async returns 204 immediately. All timeline updates
         // (user message, assistant message, parts, errors) arrive via SSE.
@@ -577,6 +581,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
 
             this.updateVariantOptions();
             this.postShellState();
+
+            // Clear stale model/provider error cards now that model is set
+            const cleared = this._timeline.clearModelProviderErrors(this._currentSessionId);
+            if (cleared > 0) {
+                this.postTimeline();
+            }
         } catch (err) {
             const msg = toMessage(err);
             if (this.isModelProviderError(msg)) {
@@ -693,7 +703,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             // Abort is not a real error — it's a user-initiated interrupt.
             // The message's finish field and info.error already carry this state;
             // rendering a big red session-level error card is misleading.
-            if (errorName === 'MessageAbortedError' || errMsg.includes('MessageAbortedError')) {
+            if (isAbortError(errorName, errMsg)) {
                 return;
             }
 
@@ -708,6 +718,15 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         }
 
         const patch = this._timeline.applyEvent(event);
+
+        // When a new assistant message completes successfully (no error),
+        // clear stale model/provider error cards — the issue is resolved.
+        if (event.type === 'message.updated') {
+            const info = event.properties?.info as { role?: string; error?: unknown } | undefined;
+            if (info?.role === 'assistant' && !info.error) {
+                this._timeline.clearModelProviderErrors(sessionID);
+            }
+        }
 
         // Note: message.info.error is rendered by the webview's renderMessageError()
         // inside the message bubble. Do NOT create a separate session-level error
@@ -805,6 +824,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     private showActionableError(message: string, actions: Array<{ label: string; action: string }>): void {
         const error = this._timeline.addError({
             sessionID: this._currentSessionId,
+            source: 'model-provider',
             message,
             actions
         });
@@ -831,7 +851,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         const error = this._timeline.addError({
             sessionID: sessionID || this._currentSessionId,
             messageID,
-            source: messageID ? 'message' : 'session',
+            source: 'model-provider',
             message,
             actions
         });
@@ -860,6 +880,19 @@ function toMessage(error: unknown): string {
         return error;
     }
     return JSON.stringify(error);
+}
+
+/**
+ * Check if an error is an abort/interrupt (not a real error).
+ * Matches: MessageAbortedError, "Tool execution aborted", AbortError, "Aborted".
+ */
+function isAbortError(name: string, message: string): boolean {
+    if (name === 'MessageAbortedError') return true;
+    if (name === 'AbortError') return true;
+    if (message.includes('MessageAbortedError')) return true;
+    if (message.includes('Tool execution aborted')) return true;
+    if (/^Aborted$/i.test(message.trim())) return true;
+    return false;
 }
 
 /**

@@ -1,4 +1,42 @@
 import * as http from 'http';
+import * as crypto from 'crypto';
+
+/**
+ * Generate a monotonically ascending message ID compatible with MiMoCode's
+ * Identifier.ascending("message") format: "msg_" + 12 hex chars (timestamp +
+ * counter encoded as 6-byte big-endian) + 14 random base62 chars.
+ *
+ * Differs from MiMoCode's Identifier.ascending only in that the random suffix
+ * uses Node crypto.randomBytes instead of Effect's random service — the format
+ * and sort order are identical.
+ */
+let _lastMsgTimestamp = 0;
+let _msgCounter = 0;
+
+export function generateMessageID(): string {
+    const now = Date.now();
+    if (now !== _lastMsgTimestamp) {
+        _lastMsgTimestamp = now;
+        _msgCounter = 0;
+    }
+    _msgCounter++;
+
+    let encoded = BigInt(now) * BigInt(0x1000) + BigInt(_msgCounter);
+    const hexChars = '0123456789abcdef';
+    let hex = '';
+    for (let i = 0; i < 12; i++) {
+        hex += hexChars[Number((encoded >> BigInt(44 - 4 * i)) & BigInt(0xf))];
+    }
+
+    const base62Chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+    const randomBytes = crypto.randomBytes(14);
+    let suffix = '';
+    for (let i = 0; i < 14; i++) {
+        suffix += base62Chars[randomBytes[i] % 62];
+    }
+
+    return `msg_${hex}${suffix}`;
+}
 
 export interface SessionInfo {
     id: string;
@@ -306,6 +344,7 @@ export interface PromptOptions {
     modelRef?: string;
     agent?: string;
     variant?: string;
+    messageID?: string;
 }
 
 export interface ConfigInfo {
@@ -506,10 +545,13 @@ export class ApiClient {
         context?: ContextPayload,
         opts: PromptOptions = {}
     ): Promise<void> {
-        const body = {
+        const body: Record<string, unknown> = {
             ...opts,
             parts: this.buildPromptParts(prompt, context)
         };
+        if (opts.messageID) {
+            body.messageID = opts.messageID;
+        }
         await this.request('POST', `/session/${encodeURIComponent(sessionId)}/prompt_async`, body);
     }
 

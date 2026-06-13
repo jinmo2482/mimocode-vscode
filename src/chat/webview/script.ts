@@ -396,7 +396,10 @@ function renderMessageError(info) {
   var errName = info.error.name || '';
   var errMsg = errorText(info.error);
   // Abort is a user-initiated interrupt, not a real error — show as subtle line
-  if (errName === 'MessageAbortedError' || errMsg.indexOf('MessageAbortedError') !== -1) {
+  if (errName === 'MessageAbortedError' || errName === 'AbortError' ||
+      errMsg.indexOf('MessageAbortedError') !== -1 ||
+      errMsg.indexOf('Tool execution aborted') !== -1 ||
+      errMsg.trim().toLowerCase() === 'aborted') {
     return '<div class="step-line"><span class="step-icon">&#x25A0;</span><span class="step-text">interrupted</span></div>';
   }
   return renderErrorCard(errMsg);

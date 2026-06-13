@@ -238,6 +238,23 @@ export class TimelineStore {
         return error;
     }
 
+    /**
+     * Remove session-level model/provider errors (source === 'model-provider'
+     * and no messageID). Called when a model change succeeds or when a new
+     * assistant message completes successfully, so stale red error cards
+     * don't linger at the bottom of the timeline.
+     */
+    clearModelProviderErrors(sessionID?: string): number {
+        const before = this._errors.length;
+        this._errors = this._errors.filter(e => {
+            if (e.source !== 'model-provider') return true;
+            if (e.messageID) return true; // keep message-level errors
+            if (sessionID && e.sessionID !== sessionID) return true;
+            return false;
+        });
+        return before - this._errors.length;
+    }
+
     mergeMessage(message: MessageWithParts): TimelineMessage {
         const next = this.upsertMessage(message.info, message.parts, false);
         this._onPatch.fire({ kind: 'message', message: next });
