@@ -403,31 +403,23 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         const sid = await this.ensureSession();
         const context = this._editorContext.gatherContext();
         const promptOptions = this.getPromptOptions(agent);
-        this._busy = true;
-        this.postShellState();
 
+        // CLI/TUI-aligned async flow:
+        // POST /prompt_async returns 204 immediately. All timeline updates
+        // (user message, assistant message, parts, errors) arrive via SSE.
+        // Busy state is driven by session.status SSE events, not manually.
         try {
-            const response = await this._apiClient.sendPrompt(sid, prompt, context, promptOptions);
-            this._timeline.mergeMessage(response);
-            await this.refreshStatus();
-            await this.reloadSessions().catch(() => undefined);
-            this.postTimeline();
+            await this._apiClient.sendPromptAsync(sid, prompt, context, promptOptions);
         } catch (err) {
+            // Only network-level failures (connection refused, timeout) reach here.
+            // Prompt-level errors (model not found, provider auth, etc.) are
+            // delivered via SSE session.error and rendered by handleSseEvent.
             const errMsg = toMessage(err);
             if (err instanceof ApiError && err.statusCode === 409) {
                 this.showError('Session is busy. Use Abort, then try again.');
-            } else if (this.isModelProviderError(errMsg)) {
-                this.showActionableError(`Model / Provider Error: ${errMsg}`, [
-                    { label: 'Change Model', action: 'changeModel' },
-                    { label: 'Refresh Providers', action: 'refreshProviders' },
-                    { label: 'Sign In Provider', action: 'signInProvider' }
-                ]);
             } else {
                 this.showError(`Failed to send prompt: ${errMsg}`);
             }
-        } finally {
-            this._busy = false;
-            this.postShellState();
         }
     }
 
@@ -690,12 +682,21 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             return;
         }
 
-        // For session.error: detect model/provider errors BEFORE applying to timeline
-        // so we only show the actionable card, not a duplicate plain error.
+        // For session.error: handle special cases BEFORE applying to timeline.
         if (event.type === 'session.error') {
-            const errMsg = typeof event.properties.error === 'string'
-                ? event.properties.error
-                : (event.properties.error?.message || event.properties.error?.data?.message || JSON.stringify(event.properties.error));
+            const errorObj = event.properties.error;
+            const errorName = errorObj?.name || '';
+            const errMsg = typeof errorObj === 'string'
+                ? errorObj
+                : (errorObj?.message || errorObj?.data?.message || JSON.stringify(errorObj));
+
+            // Abort is not a real error — it's a user-initiated interrupt.
+            // The message's finish field and info.error already carry this state;
+            // rendering a big red session-level error card is misleading.
+            if (errorName === 'MessageAbortedError' || errMsg.includes('MessageAbortedError')) {
+                return;
+            }
+
             if (this.isModelProviderError(errMsg)) {
                 this.showActionableErrorDeduped(`Model / Provider Error: ${errMsg}`, [
                     { label: 'Change Model', action: 'changeModel' },
@@ -708,20 +709,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
 
         const patch = this._timeline.applyEvent(event);
 
-        // For message.updated: detect model/provider errors in message info
-        if (event.type === 'message.updated') {
-            const info = event.properties?.info;
-            if (info?.error) {
-                const errMsg = info.error.message || info.error.name || JSON.stringify(info.error);
-                if (this.isModelProviderError(errMsg)) {
-                    this.showActionableErrorDeduped(`Model / Provider Error: ${errMsg}`, [
-                        { label: 'Change Model', action: 'changeModel' },
-                        { label: 'Refresh Providers', action: 'refreshProviders' },
-                        { label: 'Sign In Provider', action: 'signInProvider' }
-                    ], sessionID, info.id);
-                }
-            }
-        }
+        // Note: message.info.error is rendered by the webview's renderMessageError()
+        // inside the message bubble. Do NOT create a separate session-level error
+        // card for it — that would duplicate the error display.
 
         if (event.type === 'session.diff' && sessionID) {
             const files = event.properties.diff;
