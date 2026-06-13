@@ -1,10 +1,29 @@
 import * as vscode from 'vscode';
-import { ApiClient, ApiError, ConfigInfo, PromptOptions, SessionInfo, SessionStatusInfo } from '../api/client';
+import * as path from 'path';
+import * as fs from 'fs';
+import { ApiClient, ApiError, ConfigInfo, PromptOptions, SessionInfo, SessionStatusInfo, generateMessageID } from '../api/client';
 import { SseClient, SseEvent } from '../api/sseClient';
 import { EditorContext } from '../context/editorContext';
 import { MentionProvider } from '../context/mentionProvider';
 import { DiffManager } from '../diff/diffManager';
 import { TimelineStore } from '../timeline/timelineStore';
+import { getHtml } from './webview/html';
+
+/** Full pending question request from question.asked SSE event. */
+interface PendingQuestionRequest {
+    id: string;
+    sessionID: string;
+    questions: Array<{
+        question?: string;
+        header?: string;
+        options?: Array<{ label: string; description?: string } | string>;
+        multiple?: boolean;
+        custom?: boolean;
+        key?: string;
+        params?: Record<string, string>;
+    }>;
+    tool?: { messageID?: string; callID?: string };
+}
 
 export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Disposable {
     public static readonly viewType = 'mimocode.chatView';
@@ -15,10 +34,18 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     private _providers: unknown;
     private _currentModel?: string;
     private _effectiveModelRef?: string;
+    private _currentVariant?: string;
+    private _variantOptions: string[] = [];
+    private _models: Array<{ label: string; description?: string; providerID: string; modelID: string }> = [];
     private _timeline = new TimelineStore();
     private _disposables: vscode.Disposable[] = [];
     private _busy = false;
+    private _currentAgent?: string; // synced from backend user messages (e.g. "build" after plan_exit Yes)
+    private _agents: Array<{ name: string; description?: string; mode?: string; hidden?: boolean }> = [];
     private _onSignInRequest?: () => void;
+    private _pendingQuestions = new Map<string, string>(); // sessionID+callID -> requestID (for answer lookup)
+    private _pendingQuestionRequests = new Map<string, PendingQuestionRequest>(); // requestID -> full request
+    private _errorDedup = new Map<string, number>(); // message -> lastShown timestamp
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -45,7 +72,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             enableScripts: true,
             localResourceRoots: [this._extensionUri]
         };
-        webviewView.webview.html = this.getHtml(webviewView.webview);
+        webviewView.webview.html = getHtml(webviewView.webview);
 
         this._disposables.push(webviewView.webview.onDidReceiveMessage(msg => this.handleWebviewMessage(msg)));
         webviewView.onDidDispose(() => {
@@ -59,7 +86,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
 
     async newSession(): Promise<void> {
         try {
-            const session = await this._apiClient.newSession();
+            const directory = this._editorContext.getWorkspaceRoot();
+            const session = await this._apiClient.newSession(directory ? { directory } : undefined);
             this._currentSessionId = session.id;
             await this.reloadSessions();
             await this.loadSession(session.id);
@@ -75,7 +103,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     async sendWithContext(text: string): Promise<void> {
         await this.ensureSession();
         this.show();
-        await this.handleSendPrompt(text, this._currentSessionId);
+        await this.handleSendPrompt(text);
     }
 
     async abort(): Promise<void> {
@@ -93,7 +121,19 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             await this.loadConfigAndProviders();
 
             if (!this._currentSessionId && this._sessions.length > 0) {
-                this._currentSessionId = this._sessions[0].id;
+                const workspaceRoot = this._editorContext.getWorkspaceRoot();
+                if (workspaceRoot) {
+                    // Prefer the most recent session whose directory matches the workspace
+                    const normalizedRoot = normalizePathForCompare(workspaceRoot);
+                    const match = this._sessions.find(s => normalizePathForCompare(s.directory) === normalizedRoot);
+                    if (match) {
+                        this._currentSessionId = match.id;
+                    }
+                    // If no match, leave undefined — user will get a new session on first prompt
+                } else {
+                    // No workspace — fall back to the most recent session
+                    this._currentSessionId = this._sessions[0].id;
+                }
             }
 
             if (this._currentSessionId) {
@@ -109,19 +149,90 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     }
 
     private async reloadSessions(): Promise<void> {
-        this._sessions = await this._apiClient.listSessions({ limit: 100 });
+        const workspaceRoot = this._editorContext.getWorkspaceRoot();
+        const opts: { directory?: string; limit: number } = { limit: 100 };
+        if (workspaceRoot) {
+            opts.directory = workspaceRoot;
+        }
+
+        const sessions = await this._apiClient.listSessions(opts);
+
+        // Frontend filter: even if backend filters by directory, re-verify locally
+        // to avoid cross-workspace session leakage.
+        if (workspaceRoot) {
+            const normalizedRoot = normalizePathForCompare(workspaceRoot);
+            this._sessions = sessions.filter(s => {
+                return normalizePathForCompare(s.directory) === normalizedRoot;
+            });
+        } else {
+            this._sessions = sessions;
+        }
+
         this.postShellState();
     }
 
     private async loadConfigAndProviders(): Promise<void> {
-        const [config, providers] = await Promise.all([
+        const [config, globalConfig, providers, agents] = await Promise.all([
             this._apiClient.getConfig().catch(() => ({} as ConfigInfo)),
-            this._apiClient.getProviders().catch(() => undefined)
+            this._apiClient.getGlobalConfig().catch(() => ({} as ConfigInfo)),
+            this._apiClient.getProviders().catch(() => undefined),
+            this._apiClient.getAgents().catch(() => [])
         ]);
         this._config = config;
         this._providers = providers;
-        this._currentModel = typeof config.model === 'string' ? config.model : undefined;
+        this._agents = agents;
+
+        // Model is stored in global config. GET /config returns merged (global+project),
+        // but if model was never set, it may be absent from both.
+        this._currentModel = getConfigModel(config) || getConfigModel(globalConfig);
         this._effectiveModelRef = normalizeModelRef(this._currentModel);
+
+        // Compute models list — filter to connected providers only
+        if (providers) {
+            const allModels = this._apiClient.normalizeModels(providers);
+            const connected = new Set(providers.connected || []);
+            const connectedModels = allModels.filter(m => connected.has(m.providerID));
+
+            if (connectedModels.length > 0) {
+                this._models = connectedModels;
+            } else {
+                this._models = allModels;
+            }
+
+            // Ensure current configured model is in the list even if not in connected providers
+            if (this._currentModel && !this._models.some(m => m.label === this._currentModel)) {
+                this._models.unshift({
+                    label: this._currentModel,
+                    description: 'Current configured model',
+                    providerID: this._currentModel.split('/')[0] || '',
+                    modelID: this._currentModel.split('/').slice(1).join('/')
+                });
+            }
+
+            // Update variant options for current model
+            this.updateVariantOptions();
+        } else {
+            this._models = [];
+            this._variantOptions = [];
+        }
+    }
+
+    /**
+     * Update variant options based on the current model.
+     * Variant names come from the provider model info (e.g. "low", "medium", "high").
+     */
+    private updateVariantOptions(): void {
+        if (!this._providers || !this._currentModel) {
+            this._variantOptions = [];
+            return;
+        }
+        const [providerID, ...rest] = this._currentModel.split('/');
+        const modelID = rest.join('/');
+        this._variantOptions = this._apiClient.getVariantsForModel(this._providers, providerID, modelID);
+        // If current variant is not in the new options, clear it
+        if (this._currentVariant && !this._variantOptions.includes(this._currentVariant)) {
+            this._currentVariant = undefined;
+        }
     }
 
     /**
@@ -139,6 +250,22 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
 
     private async loadSession(sessionId: string): Promise<void> {
         try {
+            // Guard: prevent loading a session from another workspace
+            const workspaceRoot = this._editorContext.getWorkspaceRoot();
+            if (workspaceRoot) {
+                const session = await this._apiClient.getSession(sessionId);
+                const normalizedRoot = normalizePathForCompare(workspaceRoot);
+                if (normalizePathForCompare(session.directory) !== normalizedRoot) {
+                    this.showError('Cannot switch to a session from another workspace.');
+                    return;
+                }
+            }
+
+            // Clear pending question mappings when switching sessions
+            this._pendingQuestions.clear();
+            this._pendingQuestionRequests.clear();
+            this._errorDedup.clear();
+            this._currentAgent = undefined;
             this._currentSessionId = sessionId;
             const [session, messages, statuses] = await Promise.all([
                 this._apiClient.getSession(sessionId),
@@ -155,9 +282,54 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     }
 
     private async ensureSession(): Promise<string> {
+        const workspaceRoot = this._editorContext.getWorkspaceRoot();
+
+        if (workspaceRoot) {
+            const normalizedRoot = normalizePathForCompare(workspaceRoot);
+
+            // If we have a current session, verify it belongs to this workspace
+            if (this._currentSessionId) {
+                const currentSession = this._sessions.find(s => s.id === this._currentSessionId);
+                if (currentSession && normalizePathForCompare(currentSession.directory) === normalizedRoot) {
+                    console.log(`[MiMoCode] ensureSession: reusing ${this._currentSessionId} (directory=${currentSession.directory})`);
+                    return this._currentSessionId;
+                }
+                // Current session doesn't match workspace — find or create
+                this._currentSessionId = undefined;
+            }
+
+            // Find a session in the list that matches this workspace
+            const match = this._sessions.find(s => normalizePathForCompare(s.directory) === normalizedRoot);
+            if (match) {
+                this._currentSessionId = match.id;
+                console.log(`[MiMoCode] ensureSession: switched to ${match.id} (directory=${match.directory})`);
+                return match.id;
+            }
+
+            // No matching session — create a new one
+            const session = await this._apiClient.newSession({ directory: workspaceRoot });
+            // Verify the server actually used the requested directory
+            const created = await this._apiClient.getSession(session.id);
+            if (normalizePathForCompare(created.directory) !== normalizedRoot) {
+                console.warn(
+                    `[MiMoCode] Server ignored requested session directory. ` +
+                    `requested: ${workspaceRoot}, actual: ${created.directory}`
+                );
+            }
+            this._currentSessionId = created.id;
+            console.log(`[MiMoCode] ensureSession: created ${created.id} for directory=${workspaceRoot}`);
+            await this.reloadSessions();
+            this._timeline.reset(created, []);
+            this.postTimeline();
+            return created.id;
+        }
+
+        // No workspace root
         if (this._currentSessionId) {
             return this._currentSessionId;
         }
+
+        // No workspace, no session — create one without directory
         const session = await this._apiClient.newSession();
         this._currentSessionId = session.id;
         await this.reloadSessions();
@@ -173,7 +345,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                     await this.initializeWebview();
                     break;
                 case 'sendPrompt':
-                    await this.handleSendPrompt(msg.text, msg.sessionId);
+                    await this.handleSendPrompt(msg.text, msg.agent);
                     break;
                 case 'abort':
                     await this.abort();
@@ -189,6 +361,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                     break;
                 case 'forkSession':
                     await this.handleForkSession(msg.sessionId, msg.messageId);
+                    break;
+                case 'revertSession':
+                    await this.handleRevertSession(msg.sessionId, msg.messageId);
                     break;
                 case 'searchMention':
                     await this.handleSearchMention(msg.query);
@@ -211,39 +386,72 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                 case 'signIn':
                     this._onSignInRequest?.();
                     break;
+                case 'answerQuestion':
+                    await this.handleAnswerQuestion({
+                        answer: msg.answer,
+                        answers: msg.answers,
+                        sessionId: msg.sessionId,
+                        messageId: msg.messageId,
+                        toolCallId: msg.toolCallId,
+                        requestID: msg.requestID
+                    });
+                    break;
+                case 'openPlanFile':
+                    await this.handleOpenPlanFile(msg.path);
+                    break;
+                case 'setModel':
+                    await this.handleSetModel(msg.model);
+                    break;
+                case 'setVariant':
+                    await this.handleSetVariant(msg.variant);
+                    break;
+                case 'changeModel':
+                    vscode.commands.executeCommand('mimocode.setModel');
+                    break;
+                case 'refreshProviders':
+                    await this.refreshProviders();
+                    break;
+                case 'signInProvider':
+                    vscode.commands.executeCommand('mimocode.signInProvider');
+                    break;
             }
         } catch (err) {
             this.showError(toMessage(err));
         }
     }
 
-    private async handleSendPrompt(text: string, sessionId?: string): Promise<void> {
+    private async handleSendPrompt(text: string, agent?: string): Promise<void> {
         const prompt = String(text || '').trim();
         if (!prompt) {
             return;
         }
 
-        const sid = sessionId || await this.ensureSession();
+        // Always go through ensureSession() so workspace directory is validated;
+        // do not trust any sessionId from the webview directly.
+        const sid = await this.ensureSession();
         const context = this._editorContext.gatherContext();
-        const promptOptions = this.getPromptOptions();
-        this._busy = true;
-        this.postShellState();
+        const promptOptions = this.getPromptOptions(agent);
 
+        // Generate messageID client-side (same format as TUI MessageID.ascending).
+        // This lets the server associate the user message with a known ID.
+        promptOptions.messageID = generateMessageID();
+
+        // CLI/TUI-aligned async flow:
+        // POST /prompt_async returns 204 immediately. All timeline updates
+        // (user message, assistant message, parts, errors) arrive via SSE.
+        // Busy state is driven by session.status SSE events, not manually.
         try {
-            const response = await this._apiClient.sendPrompt(sid, prompt, context, promptOptions);
-            this._timeline.mergeMessage(response);
-            await this.refreshStatus();
-            await this.reloadSessions().catch(() => undefined);
-            this.postTimeline();
+            await this._apiClient.sendPromptAsync(sid, prompt, context, promptOptions);
         } catch (err) {
+            // Only network-level failures (connection refused, timeout) reach here.
+            // Prompt-level errors (model not found, provider auth, etc.) are
+            // delivered via SSE session.error and rendered by handleSseEvent.
+            const errMsg = toMessage(err);
             if (err instanceof ApiError && err.statusCode === 409) {
                 this.showError('Session is busy. Use Abort, then try again.');
             } else {
-                this.showError(`Failed to send prompt: ${toMessage(err)}`);
+                this.showError(`Failed to send prompt: ${errMsg}`);
             }
-        } finally {
-            this._busy = false;
-            this.postShellState();
         }
     }
 
@@ -257,7 +465,20 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         }
         await this.reloadSessions();
         if (!this._currentSessionId && this._sessions.length > 0) {
-            await this.loadSession(this._sessions[0].id);
+            // When workspace exists, pick a matching session; otherwise fall back to first
+            const workspaceRoot = this._editorContext.getWorkspaceRoot();
+            if (workspaceRoot) {
+                const normalizedRoot = normalizePathForCompare(workspaceRoot);
+                const match = this._sessions.find(s => normalizePathForCompare(s.directory) === normalizedRoot);
+                if (match) {
+                    await this.loadSession(match.id);
+                } else {
+                    this._timeline.reset(undefined, []);
+                    this.postTimeline();
+                }
+            } else {
+                await this.loadSession(this._sessions[0].id);
+            }
         } else {
             this._timeline.reset(undefined, []);
             this.postTimeline();
@@ -274,6 +495,16 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         await this.loadSession(forked.id);
     }
 
+    private async handleRevertSession(sessionId?: string, messageId?: string): Promise<void> {
+        const source = sessionId || this._currentSessionId;
+        if (!source || !messageId) {
+            return;
+        }
+        const reverted = await this._apiClient.revertSession(source, messageId);
+        await this.reloadSessions();
+        await this.loadSession(reverted.id);
+    }
+
     private async handleSearchMention(query: string): Promise<void> {
         const items = await this._mentionProvider.getMentionItems(query || '');
         this.postMessage({ type: 'mentionResults', items });
@@ -282,6 +513,227 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     private async handleResolveMention(item: any): Promise<void> {
         const content = await this._mentionProvider.resolveMentionContent(item);
         this.postMessage({ type: 'mentionContent', item, content });
+    }
+
+    private async handleAnswerQuestion(payload: {
+        answer?: string;
+        answers?: string[][];
+        sessionId?: string;
+        messageId?: string;
+        toolCallId?: string;
+        requestID?: string;
+    }): Promise<void> {
+        // Build answers array: prefer payload.answers, fall back to [[payload.answer]]
+        let answers: string[][] | undefined = payload.answers;
+        if (!answers && payload.answer) {
+            answers = [[payload.answer]];
+        }
+        if (!answers || answers.length === 0) {
+            return;
+        }
+
+        const sid = payload.sessionId || this._currentSessionId;
+
+        // Resolve requestID: from payload, from pending map (session-scoped), or try fetching
+        let requestID = payload.requestID;
+        if (!requestID && payload.toolCallId && sid) {
+            requestID = this._pendingQuestions.get(`${sid}:${payload.toolCallId}`);
+        }
+        if (!requestID) {
+            requestID = await this.findPendingQuestionRequestID(sid);
+        }
+
+        if (requestID) {
+            try {
+                await this._apiClient.answerQuestion(requestID, answers);
+                // Clean up pending map
+                if (payload.toolCallId && sid) {
+                    this._pendingQuestions.delete(`${sid}:${payload.toolCallId}`);
+                }
+                return;
+            } catch {
+                // Fall through to appendTuiPrompt only for single-answer
+            }
+        }
+
+        // Fallback: appendTuiPrompt (only for single answer)
+        if (answers.length === 1 && answers[0].length === 1) {
+            try {
+                await this._apiClient.appendTuiPrompt(answers[0][0] + '\n');
+            } catch {
+                this.showError('Failed to answer MiMoCode question. The headless question answer protocol may be unsupported.');
+            }
+        }
+    }
+
+    /**
+     * Open a plan file in the VS Code editor.
+     * MiMoCode plan paths are relative to the worktree, not the VS Code workspace.
+     * We try multiple candidates and open the first one that exists on disk.
+     */
+    private async handleOpenPlanFile(planPath: string): Promise<void> {
+        if (!planPath) return;
+
+        const workspaceRoot = this._editorContext.getWorkspaceRoot();
+        const candidates: string[] = [];
+
+        // 1. Absolute path as-is
+        if (path.isAbsolute(planPath)) {
+            candidates.push(planPath);
+        }
+
+        // 2. If looks like home-relative (e.g. "home/jm/.local/..." missing leading /)
+        if (!path.isAbsolute(planPath) && /^home\/|^Users\//.test(planPath)) {
+            candidates.push('/' + planPath);
+        }
+
+        // 3-6. Try MiMoCode paths
+        try {
+            const mimoPath = await this._apiClient.getPath();
+            if (mimoPath) {
+                // 3. Relative to worktree
+                if (mimoPath.worktree) {
+                    candidates.push(path.resolve(mimoPath.worktree, planPath));
+                }
+                // 4. Relative to directory
+                if (mimoPath.directory) {
+                    candidates.push(path.resolve(mimoPath.directory, planPath));
+                }
+                // 5. state/plans/basename
+                if (mimoPath.state) {
+                    candidates.push(path.join(mimoPath.state, 'plans', path.basename(planPath)));
+                }
+            }
+        } catch {
+            // getPath failed — continue with remaining candidates
+        }
+
+        // 6. Relative to workspace root
+        if (workspaceRoot) {
+            candidates.push(path.resolve(workspaceRoot, planPath));
+        }
+
+        // Try candidates in order
+        for (const candidate of candidates) {
+            try {
+                if (fs.existsSync(candidate)) {
+                    const uri = vscode.Uri.file(candidate);
+                    await vscode.window.showTextDocument(uri);
+                    return;
+                }
+            } catch {
+                // continue
+            }
+        }
+
+        // None found — show error with all candidates for debugging
+        this.showError(`Plan file not found. Tried: ${candidates.join(', ')}`);
+    }
+
+    /**
+     * Try to find the requestID for a pending question by fetching GET /question.
+     * Matches by sessionID if available.
+     */
+    private async findPendingQuestionRequestID(sessionId?: string): Promise<string | undefined> {
+        try {
+            const questions = await this._apiClient.listPendingQuestions();
+            if (!Array.isArray(questions) || questions.length === 0) {
+                return undefined;
+            }
+            // Find a question matching the current session only; never cross sessions
+            const match = sessionId
+                ? questions.find(q => q.sessionID === sessionId)
+                : questions[0];
+            if (match) {
+                // Store the mapping for future use (session-scoped)
+                if (match.tool?.callID && match.sessionID) {
+                    this._pendingQuestions.set(`${match.sessionID}:${match.tool.callID}`, match.id);
+                }
+                return match.id;
+            }
+        } catch {
+            // ignore
+        }
+        return undefined;
+    }
+
+    /**
+     * Public: set the current model. Called from webview or command palette.
+     * Model is stored in global config via PATCH /global/config.
+     */
+    async setModel(modelRef: string): Promise<void> {
+        if (!modelRef) return;
+        try {
+            await this._apiClient.setModel(modelRef);
+            await this.loadConfigAndProviders();
+
+            // Verify: read back from config
+            const effective = normalizeModelRef(this._currentModel);
+            if (!effective) {
+                // Config readback empty — trust the PATCH succeeded, update local state
+                this._currentModel = modelRef;
+                this._effectiveModelRef = normalizeModelRef(modelRef);
+            } else if (effective !== normalizeModelRef(modelRef)) {
+                this.showError(
+                    `Model update did not persist. Requested: ${modelRef}, current: ${effective}.`
+                );
+            }
+
+            this.updateVariantOptions();
+            this.postShellState();
+
+            // Clear stale model/provider error cards now that model is set
+            const cleared = this._timeline.clearModelProviderErrors(this._currentSessionId);
+            if (cleared > 0) {
+                this.postTimeline();
+            }
+        } catch (err) {
+            const msg = toMessage(err);
+            if (this.isModelProviderError(msg)) {
+                this.showActionableError(`Failed to set model: ${msg}`, [
+                    { label: 'Change Model', action: 'changeModel' },
+                    { label: 'Refresh Providers', action: 'refreshProviders' },
+                    { label: 'Sign In Provider', action: 'signInProvider' }
+                ]);
+            } else {
+                this.showError(`Failed to set model: ${msg}`);
+            }
+        }
+    }
+
+    /**
+     * Public: set the current variant (reasoning effort). Called from webview or command palette.
+     */
+    async setVariant(variant: string | undefined): Promise<void> {
+        this._currentVariant = variant || undefined;
+        this.postShellState();
+    }
+
+    /**
+     * Public: get current variant options for the command palette.
+     */
+    getVariantOptions(): string[] {
+        return [...this._variantOptions];
+    }
+
+    /**
+     * Public: get current models list for the command palette.
+     */
+    getModels(): Array<{ label: string; description?: string; providerID: string; modelID: string }> {
+        return [...this._models];
+    }
+
+    private async handleSetModel(modelRef: string): Promise<void> {
+        await this.setModel(modelRef);
+    }
+
+    private async handleSetVariant(variant: string): Promise<void> {
+        // Validate variant is in allowed list (empty string means default/no variant)
+        if (variant && this._variantOptions.length > 0 && !this._variantOptions.includes(variant)) {
+            this.showError(`Invalid variant "${variant}". Allowed: ${this._variantOptions.join(', ')}`);
+            return;
+        }
+        await this.setVariant(variant || undefined);
     }
 
     private async refreshStatus(): Promise<void> {
@@ -293,6 +745,59 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     }
 
     private handleSseEvent(event: SseEvent): void {
+        // Handle question events — use session-scoped key (sessionID+callID)
+        if (event.type === 'question.asked') {
+            const requestID = event.properties?.id as string | undefined;
+            const sessionID = event.properties?.sessionID as string | undefined;
+            const callID =
+                (event.properties?.tool?.callID as string | undefined) ||
+                (event.properties?.callID as string | undefined) ||
+                (event.properties?.part?.callID as string | undefined) ||
+                (event.properties?.toolCallId as string | undefined) ||
+                (event.properties?.toolCallID as string | undefined);
+            if (requestID && sessionID) {
+                // Store the full request for webview rendering
+                this._pendingQuestionRequests.set(requestID, {
+                    id: requestID,
+                    sessionID,
+                    questions: (event.properties?.questions as PendingQuestionRequest['questions']) || [],
+                    tool: callID ? { messageID: event.properties?.tool?.messageID as string | undefined, callID } : undefined
+                });
+                // Also maintain the callID → requestID map for answer lookup
+                if (callID && sessionID === this._currentSessionId) {
+                    const key = `${sessionID}:${callID}`;
+                    this._pendingQuestions.set(key, requestID);
+                }
+                // Re-post timeline to show new pending question
+                if (sessionID === this._currentSessionId) {
+                    this.postTimeline();
+                }
+            }
+            return;
+        }
+        if (event.type === 'question.replied' || event.type === 'question.rejected') {
+            const requestID =
+                (event.properties?.requestID as string | undefined) ||
+                (event.properties?.id as string | undefined);
+            const sessionID = event.properties?.sessionID as string | undefined;
+            if (requestID) {
+                this._pendingQuestionRequests.delete(requestID);
+            }
+            if (requestID && sessionID) {
+                const prefix = `${sessionID}:`;
+                for (const [key, rid] of this._pendingQuestions.entries()) {
+                    if (key.startsWith(prefix) && rid === requestID) {
+                        this._pendingQuestions.delete(key);
+                        break;
+                    }
+                }
+            }
+            if (sessionID === this._currentSessionId) {
+                this.postTimeline();
+            }
+            return;
+        }
+
         const sessionID = event.properties?.sessionID as string | undefined;
         if (sessionID && this._currentSessionId && sessionID !== this._currentSessionId) {
             if (event.type === 'session.updated' || event.type === 'session.created' || event.type === 'session.deleted') {
@@ -306,10 +811,54 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             return;
         }
 
+        // For session.error: handle special cases BEFORE applying to timeline.
+        if (event.type === 'session.error') {
+            const errorObj = event.properties.error;
+            const errorName = errorObj?.name || '';
+            const errMsg = typeof errorObj === 'string'
+                ? errorObj
+                : (errorObj?.message || errorObj?.data?.message || JSON.stringify(errorObj));
+
+            // Abort is not a real error — it's a user-initiated interrupt.
+            // The message's finish field and info.error already carry this state;
+            // rendering a big red session-level error card is misleading.
+            if (isAbortError(errorName, errMsg)) {
+                return;
+            }
+
+            if (this.isModelProviderError(errMsg)) {
+                this.showActionableErrorDeduped(`Model / Provider Error: ${errMsg}`, [
+                    { label: 'Change Model', action: 'changeModel' },
+                    { label: 'Refresh Providers', action: 'refreshProviders' },
+                    { label: 'Sign In Provider', action: 'signInProvider' }
+                ], sessionID);
+                return; // skip plain error card
+            }
+        }
+
         const patch = this._timeline.applyEvent(event);
+
+        // When a new assistant message completes successfully (no error),
+        // clear stale model/provider error cards — the issue is resolved.
+        if (event.type === 'message.updated') {
+            const info = event.properties?.info as { role?: string; agent?: string; error?: unknown } | undefined;
+            if (info?.role === 'assistant' && !info.error) {
+                this._timeline.clearModelProviderErrors(sessionID);
+            }
+            // Sync agent from user messages (captures plan_exit Yes → build)
+            if (info?.role === 'user' && info.agent && sessionID === this._currentSessionId) {
+                this._currentAgent = info.agent;
+                this.postShellState();
+            }
+        }
+
+        // Note: message.info.error is rendered by the webview's renderMessageError()
+        // inside the message bubble. Do NOT create a separate session-level error
+        // card for it — that would duplicate the error display.
+
         if (event.type === 'session.diff' && sessionID) {
             const files = event.properties.diff;
-            if (Array.isArray(files)) {
+            if (Array.isArray(files) && files.length > 0) {
                 this._diffManager.addFileDiffs(sessionID, files, event.properties.messageID as string | undefined);
             }
         }
@@ -335,19 +884,60 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             providers: this._providers,
             sseState: this._sseClient.state,
             busy: this._busy,
-            model: this._effectiveModelRef || this._currentModel
+            model: this._effectiveModelRef || this._currentModel,
+            models: this._models,
+            variant: this._currentVariant,
+            variantOptions: this._variantOptions,
+            currentAgent: this._currentAgent,
+            agents: this._agents
         });
     }
 
-    private getPromptOptions(): PromptOptions {
+    private getPromptOptions(agent?: string): PromptOptions {
+        const opts: PromptOptions = {};
         if (this._effectiveModelRef) {
-            return { modelRef: this._effectiveModelRef };
+            opts.modelRef = this._effectiveModelRef;
         }
-        return {};
+        if (this._currentVariant) {
+            opts.variant = this._currentVariant;
+        }
+        if (agent) {
+            opts.agent = agent;
+        }
+        return opts;
     }
 
     private postTimeline(): void {
-        this.postMessage({ type: 'timelineSnapshot', snapshot: this._timeline.snapshot() });
+        const snapshot = this._timeline.snapshot();
+        this.injectQuestionRequestIDs(snapshot);
+        // Include session-level pending questions (e.g. plan_exit) that may not
+        // yet have a corresponding tool part in the message stream.
+        const pendingQuestions: PendingQuestionRequest[] = [];
+        for (const [rid, req] of this._pendingQuestionRequests) {
+            if (req.sessionID === this._currentSessionId) {
+                pendingQuestions.push(req);
+            }
+        }
+        (snapshot as any).pendingQuestions = pendingQuestions;
+        this.postMessage({ type: 'timelineSnapshot', snapshot });
+    }
+
+    /**
+     * Inject pending question requestIDs into question tool parts
+     * so the webview can use them when answering.
+     */
+    private injectQuestionRequestIDs(snapshot: { messages: Array<{ parts: Array<any> }> }): void {
+        for (const message of snapshot.messages) {
+            for (const part of message.parts) {
+                if (part.type === 'tool' && part.tool === 'question' && part.state?.status !== 'completed') {
+                    const key = `${part.sessionID}:${part.callID}`;
+                    const requestID = this._pendingQuestions.get(key);
+                    if (requestID && !part._questionRequestID) {
+                        part._questionRequestID = requestID;
+                    }
+                }
+            }
+        }
     }
 
     private postMessage(message: unknown): void {
@@ -362,672 +952,59 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         vscode.window.showErrorMessage(message);
     }
 
+    /**
+     * Show an actionable error card in the timeline (no VS Code toast).
+     * Used for model/provider errors that the user can fix from the UI.
+     */
+    private showActionableError(message: string, actions: Array<{ label: string; action: string }>): void {
+        const error = this._timeline.addError({
+            sessionID: this._currentSessionId,
+            source: 'model-provider',
+            message,
+            actions
+        });
+        this.postMessage({ type: 'timelinePatch', patch: { kind: 'error', error } });
+        this.postTimeline();
+    }
+
+    /**
+     * Show an actionable error card with deduplication (5s window).
+     * Prevents the same error from flooding the timeline.
+     */
+    private showActionableErrorDeduped(
+        message: string,
+        actions: Array<{ label: string; action: string }>,
+        sessionID?: string,
+        messageID?: string
+    ): void {
+        const now = Date.now();
+        const dedupKey = `${sessionID || ''}:${message}`;
+        const lastShown = this._errorDedup.get(dedupKey) || 0;
+        if (now - lastShown < 5000) return;
+        this._errorDedup.set(dedupKey, now);
+
+        const error = this._timeline.addError({
+            sessionID: sessionID || this._currentSessionId,
+            messageID,
+            source: 'model-provider',
+            message,
+            actions
+        });
+        this.postMessage({ type: 'timelinePatch', patch: { kind: 'error', error } });
+        this.postTimeline();
+    }
+
+    /**
+     * Check if an error is a model/provider error that should show actionable card.
+     */
+    private isModelProviderError(errMsg: string): boolean {
+        return /insufficient.+balance|not supported.+model|param incorrect|unauthorized|provider/i.test(errMsg);
+    }
+
     dispose(): void {
         this._timeline.dispose();
         this._disposables.forEach(disposable => disposable.dispose());
     }
-
-    private getHtml(webview: vscode.Webview): string {
-        const nonce = getNonce();
-        const csp = `default-src 'none'; img-src ${webview.cspSource} data:; style-src 'unsafe-inline' ${webview.cspSource}; script-src 'nonce-${nonce}';`;
-        return `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="${csp}">
-    <title>MiMoCode</title>
-    <style>${getStyles()}</style>
-</head>
-<body>
-    <header class="topbar">
-        <div class="status-dot" id="status-dot" title="Connection status"></div>
-        <select id="session-select" title="Session"></select>
-        <button id="new-session" title="New session">＋</button>
-        <button id="refresh" title="Refresh">↻</button>
-    </header>
-    <section class="meta" id="meta"></section>
-    <section id="login-screen" class="login-screen hidden">
-        <div class="login-card">
-            <div class="login-logo">✱</div>
-            <h2>Welcome to MiMoCode</h2>
-            <p>Sign in to an AI provider to start coding with MiMoCode.</p>
-            <button id="sign-in-btn" class="login-btn">Sign In to Provider</button>
-            <p class="login-hint">Or use Ctrl+Shift+P → MiMoCode: Sign In to Provider</p>
-        </div>
-    </section>
-    <main id="timeline" class="timeline"></main>
-    <section id="mentions" class="mentions hidden"></section>
-    <footer class="composer">
-        <textarea id="prompt" placeholder="Ask MiMoCode... Use @ to mention files"></textarea>
-        <div class="composer-actions">
-            <button id="send">Send</button>
-            <button id="abort" class="secondary">Abort</button>
-        </div>
-    </footer>
-    <script nonce="${nonce}">${getScript()}</script>
-</body>
-</html>`;
-    }
-}
-
-function getStyles(): string {
-    return String.raw`
-* { box-sizing: border-box; margin: 0; padding: 0; }
-html, body {
-    height: 100%;
-    width: 100%;
-    overflow: hidden;
-}
-body {
-    color: var(--vscode-foreground);
-    background: var(--vscode-sideBar-background);
-    font-family: var(--vscode-font-family);
-    font-size: var(--vscode-font-size);
-    display: grid;
-    grid-template-rows: auto auto 1fr auto auto;
-    grid-template-areas:
-        "topbar"
-        "meta"
-        "main"
-        "mentions"
-        "composer";
-}
-/* Login screen */
-.login-screen {
-    grid-area: main;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: clamp(8px, 2vw, 16px);
-    min-height: 0;
-    overflow-y: auto;
-    animation: fadeIn 0.3s ease;
-}
-@keyframes fadeIn {
-    from { opacity: 0; transform: translateY(8px); }
-    to { opacity: 1; transform: translateY(0); }
-}
-.login-screen.hidden { display: none; }
-.login-card {
-    text-align: center;
-    width: min(90%, 340px);
-    box-sizing: border-box;
-    padding: clamp(20px, 5vw, 36px) clamp(16px, 4vw, 28px);
-    border: 1px solid var(--vscode-panel-border);
-    border-radius: clamp(10px, 2vw, 16px);
-    background: var(--vscode-editor-background);
-    box-shadow: 0 4px 24px rgba(0,0,0,0.15);
-}
-.login-logo {
-    font-size: clamp(32px, 6vw, 48px);
-    margin-bottom: clamp(8px, 2vw, 16px);
-    color: var(--vscode-textLink-foreground);
-    line-height: 1;
-}
-.login-card h2 {
-    margin: 0 0 clamp(6px, 1.5vw, 10px);
-    font-size: clamp(16px, 3vw, 20px);
-    font-weight: 600;
-    letter-spacing: -0.01em;
-}
-.login-card p {
-    margin: 0 0 clamp(12px, 3vw, 20px);
-    color: var(--vscode-descriptionForeground);
-    font-size: clamp(12px, 2vw, 14px);
-    line-height: 1.5;
-}
-.login-btn {
-    width: 100%;
-    padding: clamp(8px, 2vw, 12px) 20px;
-    font-size: clamp(13px, 2.2vw, 15px);
-    font-weight: 500;
-    border-radius: 8px;
-    margin-bottom: clamp(10px, 2.5vw, 16px);
-    transition: background 0.15s, transform 0.1s;
-}
-.login-btn:hover { transform: translateY(-1px); }
-.login-btn:active { transform: translateY(0); }
-.login-hint {
-    font-size: clamp(10px, 1.5vw, 12px) !important;
-    color: var(--vscode-descriptionForeground) !important;
-    margin: 0 !important;
-    opacity: 0.8;
-}
-/* Topbar */
-.topbar {
-    grid-area: topbar;
-    display: grid;
-    grid-template-columns: auto 1fr auto auto;
-    gap: clamp(4px, 1vw, 8px);
-    align-items: center;
-    padding: clamp(6px, 1.2vw, 10px) clamp(8px, 1.5vw, 12px);
-    border-bottom: 1px solid var(--vscode-panel-border);
-    min-width: 0;
-    background: var(--vscode-sideBar-background);
-}
-.topbar select {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    border-radius: 4px;
-    padding: 2px 4px;
-}
-.status-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 99px;
-    background: var(--vscode-descriptionForeground);
-    flex-shrink: 0;
-    transition: background 0.3s;
-}
-.status-dot.connected { background: var(--vscode-testing-iconPassed); }
-.status-dot.retrying, .status-dot.connecting { background: var(--vscode-testing-iconQueued); animation: pulse 1.5s infinite; }
-.status-dot.error { background: var(--vscode-testing-iconFailed); }
-@keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
-}
-/* Form elements */
-select, textarea, button { font: inherit; }
-select, textarea {
-    color: var(--vscode-input-foreground);
-    background: var(--vscode-input-background);
-    border: 1px solid var(--vscode-input-border);
-}
-button {
-    color: var(--vscode-button-foreground);
-    background: var(--vscode-button-background);
-    border: 0;
-    border-radius: 5px;
-    padding: clamp(4px, 1vw, 6px) clamp(8px, 2vw, 12px);
-    cursor: pointer;
-    white-space: nowrap;
-    transition: background 0.15s, opacity 0.15s;
-}
-button:hover { background: var(--vscode-button-hoverBackground); }
-button.secondary {
-    color: var(--vscode-button-secondaryForeground);
-    background: var(--vscode-button-secondaryBackground);
-}
-button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
-button:disabled { opacity: 0.4; cursor: default; pointer-events: none; }
-/* Meta bar */
-.meta {
-    grid-area: meta;
-    color: var(--vscode-descriptionForeground);
-    border-bottom: 1px solid var(--vscode-panel-border);
-    padding: clamp(4px, 1vw, 7px) clamp(8px, 1.5vw, 12px);
-    display: flex;
-    gap: clamp(4px, 1vw, 8px);
-    flex-wrap: wrap;
-    font-size: clamp(10px, 1.5vw, 12px);
-    min-width: 0;
-    background: var(--vscode-sideBar-background);
-}
-.chip {
-    border: 1px solid var(--vscode-panel-border);
-    border-radius: 999px;
-    padding: 1px clamp(6px, 1.2vw, 8px);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 100%;
-    line-height: 1.6;
-}
-/* Timeline */
-.timeline {
-    grid-area: main;
-    overflow-y: auto;
-    overflow-x: hidden;
-    padding: clamp(8px, 2vw, 14px) clamp(8px, 2vw, 12px);
-    min-height: 0;
-    word-break: break-word;
-    scroll-behavior: smooth;
-}
-.empty {
-    color: var(--vscode-descriptionForeground);
-    padding: clamp(24px, 5vw, 40px) clamp(8px, 2vw, 16px);
-    text-align: center;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 12px;
-}
-.empty-icon {
-    font-size: 32px;
-    opacity: 0.6;
-    line-height: 1;
-}
-.empty-text {
-    font-size: clamp(12px, 2vw, 14px);
-    line-height: 1.5;
-    max-width: 260px;
-}
-/* Messages */
-.message {
-    border: 1px solid var(--vscode-panel-border);
-    background: var(--vscode-editor-background);
-    border-radius: clamp(6px, 1.2vw, 8px);
-    margin-bottom: clamp(6px, 1.5vw, 12px);
-    overflow: hidden;
-    min-width: 0;
-    transition: border-color 0.15s;
-}
-.message:hover { border-color: var(--vscode-focusBorder); }
-.message.user { background: var(--vscode-input-background); }
-.message-header {
-    display: flex;
-    justify-content: space-between;
-    gap: clamp(4px, 1vw, 8px);
-    padding: clamp(5px, 1.2vw, 8px) clamp(8px, 1.5vw, 10px);
-    color: var(--vscode-descriptionForeground);
-    border-bottom: 1px solid var(--vscode-panel-border);
-    font-size: clamp(10px, 1.5vw, 12px);
-    min-width: 0;
-}
-.message-header span {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-.message-body {
-    padding: clamp(8px, 2vw, 12px);
-    min-width: 0;
-    overflow: hidden;
-}
-.part { margin: clamp(6px, 1.5vw, 10px) 0; }
-.part:first-child { margin-top: 0; }
-.text { white-space: pre-wrap; word-break: break-word; line-height: 1.55; }
-.reasoning summary, .tool summary, .system summary, .retry summary {
-    cursor: pointer;
-    color: var(--vscode-textLink-foreground);
-    padding: 2px 0;
-}
-.reasoning summary:hover, .tool summary:hover, .system summary:hover, .retry summary:hover {
-    text-decoration: underline;
-}
-pre {
-    white-space: pre-wrap;
-    word-break: break-word;
-    overflow-x: auto;
-    padding: clamp(6px, 1.5vw, 10px);
-    border-radius: 6px;
-    background: var(--vscode-textCodeBlock-background);
-    max-width: 100%;
-    font-size: 0.9em;
-    line-height: 1.5;
-}
-code { font-family: var(--vscode-editor-font-family); word-break: break-all; font-size: 0.9em; }
-/* Cards */
-.tool-card, .step-card, .diff-card, .error-card, .system-card {
-    border: 1px solid var(--vscode-panel-border);
-    border-radius: clamp(5px, 1vw, 7px);
-    padding: clamp(6px, 1.5vw, 10px);
-    background: var(--vscode-sideBar-background);
-    min-width: 0;
-    overflow: hidden;
-}
-.tool-status { color: var(--vscode-descriptionForeground); font-size: clamp(10px, 1.5vw, 12px); }
-.diff-card { margin-bottom: 8px; }
-.diff-actions { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
-.error-card {
-    border-color: var(--vscode-inputValidation-errorBorder);
-    color: var(--vscode-errorForeground);
-    background: var(--vscode-inputValidation-errorBackground, var(--vscode-sideBar-background));
-    font-size: clamp(11px, 1.6vw, 13px);
-    line-height: 1.5;
-}
-/* Mentions */
-.mentions {
-    grid-area: mentions;
-    max-height: min(200px, 35vh);
-    overflow-y: auto;
-    border-top: 1px solid var(--vscode-panel-border);
-    background: var(--vscode-dropdown-background);
-    box-shadow: 0 -2px 8px rgba(0,0,0,0.1);
-}
-.mention-item {
-    padding: clamp(5px, 1.2vw, 8px) clamp(8px, 2vw, 12px);
-    cursor: pointer;
-    border-bottom: 1px solid var(--vscode-panel-border);
-    transition: background 0.1s;
-}
-.mention-item:hover { background: var(--vscode-list-hoverBackground); }
-.mention-path { color: var(--vscode-descriptionForeground); font-size: clamp(10px, 1.5vw, 12px); }
-.hidden { display: none; }
-/* Composer */
-.composer {
-    grid-area: composer;
-    padding: clamp(6px, 1.2vw, 10px);
-    border-top: 1px solid var(--vscode-panel-border);
-    background: var(--vscode-sideBar-background);
-}
-#prompt {
-    width: 100%;
-    min-height: clamp(52px, 12vw, 80px);
-    max-height: clamp(140px, 35vw, 240px);
-    resize: vertical;
-    padding: clamp(6px, 1.5vw, 10px);
-    border-radius: 6px;
-    line-height: 1.5;
-    transition: border-color 0.15s;
-}
-#prompt:focus { border-color: var(--vscode-focusBorder); outline: none; }
-.composer-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: clamp(6px, 1.5vw, 10px);
-    margin-top: clamp(6px, 1.5vw, 8px);
-}`;
-}
-
-function getScript(): string {
-    return String.raw`
-const vscode = acquireVsCodeApi();
-let state = { sessions: [], currentSessionId: null, busy: false, sseState: 'disconnected', model: undefined };
-let timeline = { messages: [], diffs: [], errors: [] };
-
-const els = {
-  statusDot: document.getElementById('status-dot'),
-  sessionSelect: document.getElementById('session-select'),
-  newSession: document.getElementById('new-session'),
-  refresh: document.getElementById('refresh'),
-  meta: document.getElementById('meta'),
-  timeline: document.getElementById('timeline'),
-  mentions: document.getElementById('mentions'),
-  prompt: document.getElementById('prompt'),
-  send: document.getElementById('send'),
-  abort: document.getElementById('abort'),
-  loginScreen: document.getElementById('login-screen'),
-  signInBtn: document.getElementById('sign-in-btn')
-};
-
-window.addEventListener('message', event => {
-  const msg = event.data;
-  switch (msg.type) {
-    case 'shellState':
-      state = { ...state, ...msg };
-      renderShell();
-      break;
-    case 'timelineSnapshot':
-      timeline = msg.snapshot || { messages: [], diffs: [], errors: [] };
-      renderTimeline();
-      break;
-    case 'pendingDiffs':
-      state.pendingDiffs = msg.diffs || [];
-      renderTimeline();
-      break;
-    case 'mentionResults':
-      renderMentions(msg.items || []);
-      break;
-    case 'mentionContent':
-      break;
-    case 'error':
-      console.error(msg.message);
-      break;
-  }
-});
-
-els.newSession.addEventListener('click', () => vscode.postMessage({ type: 'newSession' }));
-els.refresh.addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
-els.abort.addEventListener('click', () => vscode.postMessage({ type: 'abort' }));
-els.send.addEventListener('click', sendPrompt);
-els.signInBtn.addEventListener('click', () => vscode.postMessage({ type: 'signIn' }));
-els.sessionSelect.addEventListener('change', () => {
-  const sessionId = els.sessionSelect.value;
-  if (sessionId) vscode.postMessage({ type: 'switchSession', sessionId });
-});
-els.prompt.addEventListener('keydown', event => {
-  if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey) {
-    event.preventDefault();
-    sendPrompt();
-  }
-});
-els.prompt.addEventListener('input', () => {
-  const query = currentMentionQuery();
-  if (query === null) {
-    els.mentions.classList.add('hidden');
-  } else {
-    vscode.postMessage({ type: 'searchMention', query });
-  }
-});
-els.timeline.addEventListener('click', event => {
-  const button = event.target.closest('[data-action]');
-  if (!button) return;
-  const diffId = button.getAttribute('data-diff-id');
-  const action = button.getAttribute('data-action');
-  if (!diffId || !action) return;
-  vscode.postMessage({ type: action, diffId });
-});
-
-function sendPrompt() {
-  const text = els.prompt.value.trim();
-  if (!text || state.busy) return;
-  vscode.postMessage({ type: 'sendPrompt', text, sessionId: state.currentSessionId });
-  els.prompt.value = '';
-}
-
-function renderShell() {
-  const status = state.sseState || 'disconnected';
-  els.statusDot.className = 'status-dot ' + status;
-
-  // Show/hide login screen based on provider connection
-  const providers = state.providers;
-  const connected = providers && providers.connected && providers.connected.length > 0;
-  if (!connected) {
-    els.loginScreen.classList.remove('hidden');
-    els.timeline.style.display = 'none';
-    els.mentions.style.display = 'none';
-    document.querySelector('.composer').style.display = 'none';
-    document.querySelector('.meta').style.display = 'none';
-  } else {
-    els.loginScreen.classList.add('hidden');
-    els.timeline.style.display = '';
-    els.mentions.style.display = '';
-    document.querySelector('.composer').style.display = '';
-    document.querySelector('.meta').style.display = '';
-  }
-
-  els.sessionSelect.innerHTML = '';
-  if (!state.sessions || state.sessions.length === 0) {
-    const opt = document.createElement('option');
-    opt.value = '';
-    opt.textContent = 'No session';
-    els.sessionSelect.appendChild(opt);
-  } else {
-    for (const session of state.sessions) {
-      const opt = document.createElement('option');
-      opt.value = session.id;
-      opt.textContent = session.title || session.id.slice(0, 8);
-      opt.selected = session.id === state.currentSessionId;
-      els.sessionSelect.appendChild(opt);
-    }
-  }
-  els.abort.disabled = !state.busy;
-  els.send.disabled = !!state.busy;
-  const statusLabel = timeline.status?.message || timeline.status?.type || (state.busy ? 'busy' : 'idle');
-  els.meta.innerHTML = [
-    chip('SSE: ' + status),
-    chip('Run: ' + statusLabel),
-    chip('Model: ' + (state.model || 'default'))
-  ].join('');
-}
-
-function renderTimeline() {
-  renderShell();
-  const chunks = [];
-  if ((!timeline.messages || timeline.messages.length === 0) && (!timeline.errors || timeline.errors.length === 0)) {
-    chunks.push('<div class="empty"><div class="empty-icon">💬</div><div class="empty-text">Start a conversation with MiMoCode. Type your question or use @ to mention files.</div></div>');
-  }
-  for (const message of timeline.messages || []) {
-    chunks.push(renderMessage(message));
-  }
-  for (const diff of timeline.diffs || []) {
-    chunks.push(renderSessionDiff(diff));
-  }
-  for (const error of timeline.errors || []) {
-    chunks.push('<div class="error-card">' + escapeHtml(error.message) + '</div>');
-  }
-  for (const diff of state.pendingDiffs || []) {
-    chunks.push(renderPendingDiff(diff));
-  }
-  els.timeline.innerHTML = chunks.join('');
-  els.timeline.scrollTop = els.timeline.scrollHeight;
-}
-
-function renderMessage(message) {
-  const info = message.info || {};
-  const parts = message.parts || [];
-  const role = info.role || 'assistant';
-  const when = info.time?.created ? new Date(info.time.created).toLocaleTimeString() : '';
-  const label = role === 'user' ? 'You' : 'MiMoCode';
-  return '<article class="message ' + escapeAttr(role) + '">' +
-    '<div class="message-header"><span>' + escapeHtml(label) + '</span><span>' + escapeHtml(metaForMessage(info, when)) + '</span></div>' +
-    '<div class="message-body">' + parts.map(renderPart).join('') + renderMessageError(info) + '</div>' +
-  '</article>';
-}
-
-function metaForMessage(info, when) {
-  const bits = [];
-  if (info.agent) bits.push(info.agent);
-  if (info.providerID && info.modelID) bits.push(info.providerID + '/' + info.modelID);
-  if (when) bits.push(when);
-  return bits.join(' · ');
-}
-
-function renderMessageError(info) {
-  if (!info.error) return '';
-  return '<div class="error-card">' + escapeHtml(errorText(info.error)) + '</div>';
-}
-
-function renderPart(part) {
-  if (!part) return '';
-  switch (part.type) {
-    case 'text':
-      return '<div class="part text">' + renderMarkdown(part.text || '') + '</div>';
-    case 'reasoning':
-      return '<details class="part reasoning"><summary>Reasoning</summary><pre>' + escapeHtml(part.text || '') + '</pre></details>';
-    case 'tool':
-      return renderTool(part);
-    case 'step-start':
-      return '<div class="part step-card">Step started' + (part.snapshot ? ': ' + escapeHtml(part.snapshot) : '') + '</div>';
-    case 'step-finish':
-      return '<div class="part step-card">Step finished: ' + escapeHtml(part.reason || 'done') + renderTokens(part.tokens, part.cost) + '</div>';
-    case 'retry':
-      return '<details class="part retry"><summary>Retry attempt ' + escapeHtml(String(part.attempt)) + '</summary><pre>' + escapeHtml(JSON.stringify(part.error, null, 2)) + '</pre></details>';
-    case 'patch':
-      return '<div class="part system-card">Patch: ' + escapeHtml((part.files || []).join(', ')) + '</div>';
-    case 'file':
-      return '<div class="part system-card">File: ' + escapeHtml(part.filename || part.url || 'attachment') + '</div>';
-    case 'agent':
-      return '<div class="part system-card">Agent: ' + escapeHtml(part.name || 'unknown') + '</div>';
-    case 'subtask':
-      return '<details class="part system"><summary>Subtask: ' + escapeHtml(part.description || part.agent || 'subtask') + '</summary><pre>' + escapeHtml(part.prompt || '') + '</pre></details>';
-    case 'checkpoint':
-      return '<div class="part system-card">Checkpoint #' + escapeHtml(String(part.checkpointNumber || '')) + '</div>';
-    case 'compaction':
-      return '<div class="part system-card">Context compacted' + (part.auto ? ' automatically' : '') + '</div>';
-    case 'snapshot':
-      return '<div class="part system-card">Snapshot: ' + escapeHtml(part.snapshot || '') + '</div>';
-    default:
-      return '<details class="part system"><summary>' + escapeHtml(part.type || 'part') + '</summary><pre>' + escapeHtml(JSON.stringify(part, null, 2)) + '</pre></details>';
-  }
-}
-
-function renderTool(part) {
-  const state = part.state || {};
-  const title = state.title || part.tool || 'tool';
-  const status = state.status || 'pending';
-  const body = state.output || state.error || state.raw || JSON.stringify(state.input || {}, null, 2);
-  return '<details class="part tool" ' + (status === 'running' ? 'open' : '') + '>' +
-    '<summary>' + escapeHtml(title) + ' <span class="tool-status">' + escapeHtml(status) + '</span></summary>' +
-    '<div class="tool-card"><pre>' + escapeHtml(body || '') + '</pre></div>' +
-  '</details>';
-}
-
-function renderTokens(tokens, cost) {
-  const bits = [];
-  if (typeof cost === 'number') bits.push('$' + cost.toFixed(4));
-  if (tokens?.total) bits.push(tokens.total + ' tokens');
-  if (tokens?.input || tokens?.output) bits.push((tokens.input || 0) + ' in / ' + (tokens.output || 0) + ' out');
-  return bits.length ? '<div class="tool-status">' + escapeHtml(bits.join(' · ')) + '</div>' : '';
-}
-
-function renderSessionDiff(diff) {
-  const files = diff.files || [];
-  return '<div class="diff-card"><strong>Session diff</strong><div class="tool-status">' + escapeHtml(files.length + ' file(s) changed') + '</div>' +
-    '<pre>' + escapeHtml(files.map(file => file.path || file.filePath || file.newPath || file.oldPath || 'unknown').join('\n')) + '</pre></div>';
-}
-
-function renderPendingDiff(diff) {
-  const name = diff.filePath ? diff.filePath.split(/[\\/]/).pop() : 'unknown';
-  const reason = diff.conflictReason ? '<div class="error-card">' + escapeHtml(diff.conflictReason) + '</div>' : '';
-  return '<div class="diff-card"><strong>' + escapeHtml(name) + '</strong><div class="tool-status">' + escapeHtml(diff.status || 'pending') + '</div>' + reason +
-    '<div class="diff-actions">' +
-    '<button data-action="viewDiff" data-diff-id="' + escapeAttr(diff.id) + '">View</button>' +
-    '<button data-action="acceptDiff" data-diff-id="' + escapeAttr(diff.id) + '">Accept</button>' +
-    '<button class="secondary" data-action="rejectDiff" data-diff-id="' + escapeAttr(diff.id) + '">Reject</button>' +
-    '</div></div>';
-}
-
-function renderMentions(items) {
-  if (!items.length) {
-    els.mentions.classList.add('hidden');
-    return;
-  }
-  els.mentions.innerHTML = items.map((item, index) => '<div class="mention-item" data-index="' + index + '"><div>' + escapeHtml(item.label) + '</div><div class="mention-path">' + escapeHtml(item.description || item.path || '') + '</div></div>').join('');
-  els.mentions.classList.remove('hidden');
-  Array.from(els.mentions.querySelectorAll('.mention-item')).forEach(node => {
-    node.addEventListener('click', () => {
-      const item = items[Number(node.dataset.index)];
-      insertMention(item);
-      els.mentions.classList.add('hidden');
-    });
-  });
-}
-
-function insertMention(item) {
-  const value = '@' + (item.description || item.path || item.label);
-  const query = currentMentionQuery();
-  const pos = els.prompt.selectionStart;
-  const start = query === null ? pos : pos - query.length - 1;
-  els.prompt.value = els.prompt.value.slice(0, start) + value + ' ' + els.prompt.value.slice(pos);
-  els.prompt.focus();
-}
-
-function currentMentionQuery() {
-  const pos = els.prompt.selectionStart;
-  const before = els.prompt.value.slice(0, pos);
-  const match = before.match(/(?:^|\s)@([^\s@]*)$/);
-  return match ? match[1] : null;
-}
-
-function chip(text) { return '<span class="chip">' + escapeHtml(text) + '</span>'; }
-function errorText(error) { return error?.data?.message || error?.message || error?.name || JSON.stringify(error); }
-function escapeHtml(value) {
-  return String(value ?? '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
-}
-function escapeAttr(value) { return escapeHtml(value).replace(/'/g, '&#39;'); }
-function renderMarkdown(text) {
-  let html = escapeHtml(text);
-  const tick = String.fromCharCode(96);
-  html = html.replace(new RegExp(tick + '([^' + tick + ']+)' + tick, 'g'), '<code>$1</code>');
-  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  html = html.replace(/\n/g, '<br>');
-  return html;
-}
-
-vscode.postMessage({ type: 'ready' });`;
-}
-
-function getNonce(): string {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    let nonce = '';
-    for (let i = 0; i < 32; i++) {
-        nonce += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return nonce;
 }
 
 function toMessage(error: unknown): string {
@@ -1038,6 +1015,33 @@ function toMessage(error: unknown): string {
         return error;
     }
     return JSON.stringify(error);
+}
+
+/**
+ * Check if an error is an abort/interrupt (not a real error).
+ * Matches: MessageAbortedError, "Tool execution aborted", AbortError, "Aborted".
+ */
+function isAbortError(name: string, message: string): boolean {
+    if (name === 'MessageAbortedError') return true;
+    if (name === 'AbortError') return true;
+    if (message.includes('MessageAbortedError')) return true;
+    if (message.includes('Tool execution aborted')) return true;
+    if (/^Aborted$/i.test(message.trim())) return true;
+    return false;
+}
+
+/**
+ * Extract the current model from a config object.
+ * Tries multiple paths to handle different config structures.
+ */
+function getConfigModel(config: ConfigInfo): string | undefined {
+    if (typeof config.model === 'string' && config.model.trim()) {
+        return config.model.trim();
+    }
+    if (typeof (config as any).modelRef === 'string' && (config as any).modelRef.trim()) {
+        return (config as any).modelRef.trim();
+    }
+    return undefined;
 }
 
 function normalizeModelRef(model: string | undefined): string | undefined {
@@ -1052,4 +1056,9 @@ function normalizeModelRef(model: string | undefined): string | undefined {
         return 'standard';
     }
     return trimmed;
+}
+
+function normalizePathForCompare(input?: string): string | undefined {
+    if (!input) return undefined;
+    return path.resolve(input);
 }

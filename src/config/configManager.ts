@@ -30,7 +30,7 @@ export class ConfigManager implements vscode.Disposable {
         const config = vscode.workspace.getConfiguration('mimocode');
         return {
             server: {
-                port: config.get<number>('server.port', 7860),
+                port: config.get<number>('server.port', 0),
                 path: config.get<string>('server.path', 'mimo'),
                 autoStart: config.get<boolean>('server.autoStart', true)
             },

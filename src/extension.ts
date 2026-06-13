@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as crypto from 'crypto';
 import { ServerManager, ServerState } from './server/serverManager';
 import { ApiClient } from './api/client';
 import { SseClient } from './api/sseClient';
@@ -11,6 +12,15 @@ import { StatusBarManager } from './statusbar/statusBarManager';
 import { ConfigManager } from './config/configManager';
 import { SessionTreeProvider } from './tree/sessionTreeProvider';
 import { ProviderAuthController } from './provider/providerAuthController';
+
+function getWorkspaceRootForServer(): string | undefined {
+    const activeEditor = vscode.window.activeTextEditor;
+    if (activeEditor) {
+        const folder = vscode.workspace.getWorkspaceFolder(activeEditor.document.uri);
+        if (folder) return folder.uri.fsPath;
+    }
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+}
 
 let serverManager: ServerManager;
 let apiClient: ApiClient;
@@ -29,10 +39,14 @@ export async function activate(context: vscode.ExtensionContext) {
     configManager = new ConfigManager();
     const config = configManager.getConfig();
 
+    const instanceId = crypto.randomUUID();
+
     serverManager = new ServerManager({
         port: config.server.port,
         mimoPath: config.server.path,
-        autoStart: config.server.autoStart
+        autoStart: config.server.autoStart,
+        cwd: getWorkspaceRootForServer(),
+        instanceId
     });
     apiClient = new ApiClient(() => serverManager.baseUrl);
     sseClient = new SseClient();
@@ -49,7 +63,7 @@ export async function activate(context: vscode.ExtensionContext) {
         mentionProvider,
         diffManager
     );
-    sessionTreeProvider = new SessionTreeProvider(apiClient);
+    sessionTreeProvider = new SessionTreeProvider(apiClient, getWorkspaceRootForServer);
     providerAuthController = new ProviderAuthController(apiClient);
 
     // Wire webview sign-in button to the auth controller
@@ -68,8 +82,8 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    // serverManager is NOT in subscriptions — deactivate() handles its async stop.
     context.subscriptions.push(
-        serverManager,
         sseClient,
         diffManager,
         terminalBridge,
@@ -151,26 +165,30 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         }),
         vscode.commands.registerCommand('mimocode.setModel', async () => {
-            try {
-                const providers = await apiClient.getProviders();
-                const models = apiClient.normalizeModels(providers);
-                const connected = new Set(providers.connected || []);
-                // Sort: connected provider models first
-                models.sort((a, b) => {
-                    const aConn = connected.has(a.providerID) ? 0 : 1;
-                    const bConn = connected.has(b.providerID) ? 0 : 1;
-                    return aConn - bConn;
-                });
-                const selected = await vscode.window.showQuickPick(models, {
-                    placeHolder: 'Select a MiMoCode model'
-                });
-                if (selected) {
-                    await apiClient.setModel(selected.label);
-                    chatPanel.refreshProviders();
-                    vscode.window.showInformationMessage(`MiMoCode model set to ${selected.label}`);
-                }
-            } catch (err) {
-                vscode.window.showErrorMessage(`Failed to set MiMoCode model: ${err instanceof Error ? err.message : String(err)}`);
+            const models = chatPanel.getModels();
+            if (models.length === 0) {
+                vscode.window.showWarningMessage('No models available. Please sign in to a provider first.');
+                return;
+            }
+            const selected = await vscode.window.showQuickPick(models, {
+                placeHolder: 'Select a MiMoCode model'
+            });
+            if (selected) {
+                await chatPanel.setModel(selected.label);
+            }
+        }),
+        vscode.commands.registerCommand('mimocode.setVariant', async () => {
+            const variants = chatPanel.getVariantOptions();
+            if (variants.length === 0) {
+                vscode.window.showWarningMessage('No reasoning effort options available for the current model.');
+                return;
+            }
+            const items = [{ label: 'default', description: 'No reasoning effort override' }, ...variants.map(v => ({ label: v }))];
+            const selected = await vscode.window.showQuickPick(items, {
+                placeHolder: 'Select reasoning effort'
+            });
+            if (selected) {
+                await chatPanel.setVariant(selected.label === 'default' ? undefined : selected.label);
             }
         })
     );
@@ -188,14 +206,16 @@ export async function activate(context: vscode.ExtensionContext) {
         serverManager.updateConfig({
             port: newConfig.server.port,
             mimoPath: newConfig.server.path,
-            autoStart: newConfig.server.autoStart
+            autoStart: newConfig.server.autoStart,
+            cwd: getWorkspaceRootForServer(),
+            instanceId
         });
         void vscode.window.showInformationMessage('MiMoCode settings changed. Restart the MiMoCode server for port/path changes to apply.');
     });
 
     if (config.server.autoStart) {
         await serverManager.start();
-        sseClient.connect(serverManager.baseUrl);
+        // sseClient.connect is handled by serverManager.onStateChange(Running) above
     }
 }
 
@@ -224,6 +244,22 @@ async function promptModelSelection(
     }
 }
 
-export function deactivate() {
-    void serverManager?.stop();
+export async function deactivate(): Promise<void> {
+    try {
+        sseClient?.disconnect();
+    } catch {
+        // ignore
+    }
+
+    try {
+        await serverManager?.stop();
+    } catch (err) {
+        console.error('[MiMoCode] Failed to stop server during deactivate:', err);
+    }
+
+    try {
+        serverManager?.dispose();
+    } catch {
+        // ignore
+    }
 }

@@ -14,12 +14,14 @@
   "activationEvents": [
     "onView:mimocode.chatView",
     "onView:mimocode.sessionsView",
-    "onCommand:mimocode.openChat",
     "onCommand:mimocode.focusChat",
     "onCommand:mimocode.askSelection",
-    "onCommand:mimocode.openTerminal",
+    "onCommand:mimocode.newSession",
+    "onCommand:mimocode.abort",
+    "onCommand:mimocode.setModel",
+    "onCommand:mimocode.setVariant",
+    "onCommand:mimocode.refreshSessions",
     "onCommand:mimocode.openNewTerminal",
-    "onCommand:mimocode.insertFileReference",
     "onCommand:mimocode.signInProvider",
     "onCommand:mimocode.viewProviders",
     "onCommand:mimocode.refreshProviders",
@@ -99,6 +101,11 @@
       {
         "command": "mimocode.setModel",
         "title": "Set Model",
+        "category": "MiMoCode"
+      },
+      {
+        "command": "mimocode.setVariant",
+        "title": "Set Reasoning Effort",
         "category": "MiMoCode"
       },
       {
@@ -184,8 +191,8 @@
       "properties": {
         "mimocode.server.port": {
           "type": "number",
-          "default": 7860,
-          "description": "MiMoCode HTTP服务器端口"
+          "default": 0,
+          "description": "MiMoCode HTTP服务器端口。0 表示每个 VS Code 窗口自动分配独立端口，避免多窗口串服务。"
         },
         "mimocode.server.autoStart": {
           "type": "boolean",
@@ -199,7 +206,7 @@
         },
         "mimocode.model": {
           "type": "string",
-          "description": "默认模型"
+          "description": "默认模型，例如 provider/model"
         },
         "mimocode.mode": {
           "type": "string",

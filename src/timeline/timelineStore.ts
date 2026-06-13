@@ -7,12 +7,20 @@ export interface TimelineMessage {
     parts: MessagePart[];
 }
 
+export interface TimelineErrorAction {
+    label: string;
+    action: string; // action type to postMessage
+}
+
 export interface TimelineError {
     id: string;
     sessionID?: string;
+    messageID?: string;
+    source?: string;
     message: string;
     error?: unknown;
     time: number;
+    actions?: TimelineErrorAction[];
 }
 
 export interface TimelineDiff {
@@ -179,7 +187,7 @@ export class TimelineStore {
             case 'session.diff': {
                 const sessionID = event.properties.sessionID as string | undefined;
                 const diff = (event.properties.diff || event.properties.diffs) as FileDiff[] | undefined;
-                if (!sessionID || !diff) {
+                if (!sessionID || !Array.isArray(diff) || diff.length === 0) {
                     return undefined;
                 }
                 const timelineDiff = this.addDiff(sessionID, diff, event.properties.messageID as string | undefined);
@@ -215,16 +223,36 @@ export class TimelineStore {
         return diff;
     }
 
-    addError(input: { sessionID?: string; message: string; error?: unknown }): TimelineError {
+    addError(input: { sessionID?: string; messageID?: string; source?: string; message: string; error?: unknown; actions?: TimelineErrorAction[] }): TimelineError {
         const error: TimelineError = {
             id: `error_${Date.now()}_${this._errors.length}`,
             sessionID: input.sessionID,
+            messageID: input.messageID,
+            source: input.source,
             message: input.message,
             error: input.error,
-            time: Date.now()
+            time: Date.now(),
+            actions: input.actions
         };
         this._errors.push(error);
         return error;
+    }
+
+    /**
+     * Remove session-level model/provider errors (source === 'model-provider'
+     * and no messageID). Called when a model change succeeds or when a new
+     * assistant message completes successfully, so stale red error cards
+     * don't linger at the bottom of the timeline.
+     */
+    clearModelProviderErrors(sessionID?: string): number {
+        const before = this._errors.length;
+        this._errors = this._errors.filter(e => {
+            if (e.source !== 'model-provider') return true;
+            if (e.messageID) return true; // keep message-level errors
+            if (sessionID && e.sessionID !== sessionID) return true;
+            return false;
+        });
+        return before - this._errors.length;
     }
 
     mergeMessage(message: MessageWithParts): TimelineMessage {

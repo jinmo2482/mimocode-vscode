@@ -1,4 +1,42 @@
 import * as http from 'http';
+import * as crypto from 'crypto';
+
+/**
+ * Generate a monotonically ascending message ID compatible with MiMoCode's
+ * Identifier.ascending("message") format: "msg_" + 12 hex chars (timestamp +
+ * counter encoded as 6-byte big-endian) + 14 random base62 chars.
+ *
+ * Differs from MiMoCode's Identifier.ascending only in that the random suffix
+ * uses Node crypto.randomBytes instead of Effect's random service — the format
+ * and sort order are identical.
+ */
+let _lastMsgTimestamp = 0;
+let _msgCounter = 0;
+
+export function generateMessageID(): string {
+    const now = Date.now();
+    if (now !== _lastMsgTimestamp) {
+        _lastMsgTimestamp = now;
+        _msgCounter = 0;
+    }
+    _msgCounter++;
+
+    let encoded = BigInt(now) * BigInt(0x1000) + BigInt(_msgCounter);
+    const hexChars = '0123456789abcdef';
+    let hex = '';
+    for (let i = 0; i < 12; i++) {
+        hex += hexChars[Number((encoded >> BigInt(44 - 4 * i)) & BigInt(0xf))];
+    }
+
+    const base62Chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+    const randomBytes = crypto.randomBytes(14);
+    let suffix = '';
+    for (let i = 0; i < 14; i++) {
+        suffix += base62Chars[randomBytes[i] % 62];
+    }
+
+    return `msg_${hex}${suffix}`;
+}
 
 export interface SessionInfo {
     id: string;
@@ -305,6 +343,8 @@ export interface PromptOptions {
     model?: { providerID: string; modelID: string };
     modelRef?: string;
     agent?: string;
+    variant?: string;
+    messageID?: string;
 }
 
 export interface ConfigInfo {
@@ -505,10 +545,13 @@ export class ApiClient {
         context?: ContextPayload,
         opts: PromptOptions = {}
     ): Promise<void> {
-        const body = {
+        const body: Record<string, unknown> = {
             ...opts,
             parts: this.buildPromptParts(prompt, context)
         };
+        if (opts.messageID) {
+            body.messageID = opts.messageID;
+        }
         await this.request('POST', `/session/${encodeURIComponent(sessionId)}/prompt_async`, body);
     }
 
@@ -541,6 +584,10 @@ export class ApiClient {
         return this.request('PATCH', '/global/config', config);
     }
 
+    async getGlobalConfig(): Promise<ConfigInfo> {
+        return this.request('GET', '/global/config');
+    }
+
     async getProviders(): Promise<ProviderListResult> {
         return this.request('GET', '/provider');
     }
@@ -563,7 +610,7 @@ export class ApiClient {
         return this.request('POST', `/provider/${encodeURIComponent(providerID)}/oauth/callback`, input);
     }
 
-    async getAgents(): Promise<Array<{ name: string; description?: string; [key: string]: unknown }>> {
+    async getAgents(): Promise<Array<{ name: string; description?: string; mode?: string; hidden?: boolean; [key: string]: unknown }>> {
         return this.request('GET', '/agent');
     }
 
@@ -579,9 +626,23 @@ export class ApiClient {
         return this.request('POST', '/tui/append-prompt', { text });
     }
 
+    async answerQuestion(requestID: string, answers: string[][]): Promise<boolean> {
+        return this.request('POST', `/question/${encodeURIComponent(requestID)}/reply`, { answers });
+    }
+
+    async rejectQuestion(requestID: string): Promise<boolean> {
+        return this.request('POST', `/question/${encodeURIComponent(requestID)}/reject`);
+    }
+
+    async listPendingQuestions(): Promise<Array<{ id: string; sessionID: string; tool?: { callID?: string } }>> {
+        return this.request('GET', '/question');
+    }
+
     async setModel(modelRef: string): Promise<ConfigInfo> {
-        const config = await this.getConfig();
-        return this.updateConfig({ ...config, model: modelRef });
+        // Model is stored in global config, not project config.
+        // PATCH /config does NOT persist model; PATCH /global/config does.
+        const globalConfig = await this.getGlobalConfig();
+        return this.updateGlobalConfig({ ...globalConfig, model: modelRef });
     }
 
     normalizeModels(result: ProviderListResult): Array<{ label: string; description?: string; providerID: string; modelID: string }> {
@@ -605,6 +666,72 @@ export class ApiClient {
             }
         }
         return models;
+    }
+
+    /**
+     * Get available variant names (reasoning effort levels) for a specific model.
+     * Tries multiple field structures and falls back to common effort levels
+     * for reasoning-capable models.
+     */
+    getVariantsForModel(result: ProviderListResult, providerID: string, modelID: string): string[] {
+        for (const provider of result.all || []) {
+            const pid = provider.id || String((provider as any).providerID || provider.name);
+            if (pid !== providerID) continue;
+            const rawModels = provider.models || [];
+            const entries: [string, any][] = Array.isArray(rawModels)
+                ? rawModels.map(model => [model.id, model] as const)
+                : Object.entries(rawModels);
+            for (const [mid, model] of entries) {
+                if (mid !== modelID) continue;
+                return this.extractVariantOptions(model, pid, mid);
+            }
+        }
+        return [];
+    }
+
+    /**
+     * Extract variant options from a model object, trying multiple field structures.
+     * Falls back to common effort levels for reasoning-capable models.
+     */
+    private extractVariantOptions(model: any, providerID: string, modelID: string): string[] {
+        if (!model) return [];
+
+        // 1. model.variants as Record<string, any> (most common from MiMoCode provider service)
+        if (model.variants && typeof model.variants === 'object' && !Array.isArray(model.variants)) {
+            const keys = Object.keys(model.variants).filter(k => k && k !== 'default');
+            if (keys.length > 0) return keys;
+        }
+        // 2. model.variants as string[]
+        if (Array.isArray(model.variants)) {
+            const filtered = model.variants.filter((v: any) => v && v !== 'default').map(String);
+            if (filtered.length > 0) return filtered;
+        }
+        // 3. model.variant as object or array
+        if (model.variant && typeof model.variant === 'object' && !Array.isArray(model.variant)) {
+            const keys = Object.keys(model.variant).filter(k => k && k !== 'default');
+            if (keys.length > 0) return keys;
+        }
+        if (Array.isArray(model.variant)) {
+            const filtered = model.variant.filter((v: any) => v && v !== 'default').map(String);
+            if (filtered.length > 0) return filtered;
+        }
+        // 4. model.reasoning?.efforts or model.reasoning?.variants
+        if (model.reasoning && typeof model.reasoning === 'object') {
+            if (Array.isArray(model.reasoning.efforts)) {
+                const filtered = model.reasoning.efforts.filter((v: any) => v && v !== 'default').map(String);
+                if (filtered.length > 0) return filtered;
+            }
+            if (model.reasoning.variants && typeof model.reasoning.variants === 'object') {
+                const keys = Object.keys(model.reasoning.variants).filter(k => k && k !== 'default');
+                if (keys.length > 0) return keys;
+            }
+        }
+        // 5. Fallback: if model has reasoning: true, provide common effort levels
+        if (model.reasoning === true) {
+            return ['low', 'medium', 'high'];
+        }
+        // 6. No variants found
+        return [];
     }
 
     private buildPromptParts(prompt: string, context?: ContextPayload): PromptTextPartInput[] {
