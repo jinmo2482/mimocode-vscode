@@ -408,6 +408,15 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                 case 'setVariant':
                     await this.handleSetVariant(msg.variant);
                     break;
+                case 'changeModel':
+                    vscode.commands.executeCommand('mimocode.setModel');
+                    break;
+                case 'refreshProviders':
+                    await this.refreshProviders();
+                    break;
+                case 'signInProvider':
+                    vscode.commands.executeCommand('mimocode.signInProvider');
+                    break;
             }
         } catch (err) {
             this.showError(toMessage(err));
@@ -440,10 +449,17 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             await this.reloadSessions().catch(() => undefined);
             this.postTimeline();
         } catch (err) {
+            const errMsg = toMessage(err);
             if (err instanceof ApiError && err.statusCode === 409) {
                 this.showError('Session is busy. Use Abort, then try again.');
+            } else if (this.isModelProviderError(errMsg)) {
+                this.showActionableError(`Model / Provider Error: ${errMsg}`, [
+                    { label: 'Change Model', action: 'changeModel' },
+                    { label: 'Refresh Providers', action: 'refreshProviders' },
+                    { label: 'Sign In Provider', action: 'signInProvider' }
+                ]);
             } else {
-                this.showError(`Failed to send prompt: ${toMessage(err)}`);
+                this.showError(`Failed to send prompt: ${errMsg}`);
             }
         } finally {
             this._busy = false;
@@ -635,10 +651,15 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             this.postShellState();
         } catch (err) {
             const msg = toMessage(err);
-            const hint = /insufficient|balance|not supported|param incorrect|provider|unauthorized/i.test(msg)
-                ? ' Please switch to a connected provider model, or check provider login/balance.'
-                : '';
-            this.showError(`Failed to set model: ${msg}${hint}`);
+            if (this.isModelProviderError(msg)) {
+                this.showActionableError(`Failed to set model: ${msg}`, [
+                    { label: 'Change Model', action: 'changeModel' },
+                    { label: 'Refresh Providers', action: 'refreshProviders' },
+                    { label: 'Sign In Provider', action: 'signInProvider' }
+                ]);
+            } else {
+                this.showError(`Failed to set model: ${msg}`);
+            }
         }
     }
 
@@ -818,6 +839,27 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         this.postMessage({ type: 'timelinePatch', patch: { kind: 'error', error } });
         this.postTimeline();
         vscode.window.showErrorMessage(message);
+    }
+
+    /**
+     * Show an actionable error card in the timeline (no VS Code toast).
+     * Used for model/provider errors that the user can fix from the UI.
+     */
+    private showActionableError(message: string, actions: Array<{ label: string; action: string }>): void {
+        const error = this._timeline.addError({
+            sessionID: this._currentSessionId,
+            message,
+            actions
+        });
+        this.postMessage({ type: 'timelinePatch', patch: { kind: 'error', error } });
+        this.postTimeline();
+    }
+
+    /**
+     * Check if an error is a model/provider error that should show actionable card.
+     */
+    private isModelProviderError(errMsg: string): boolean {
+        return /insufficient.+balance|not supported.+model|param incorrect|unauthorized|provider/i.test(errMsg);
     }
 
     dispose(): void {

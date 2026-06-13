@@ -335,7 +335,7 @@ function renderTimeline() {
     }
   }
   for (var i = 0; i < (timeline.errors || []).length; i++) {
-    chunks.push(renderErrorCard(timeline.errors[i].message));
+    chunks.push(renderErrorCard(timeline.errors[i].message, timeline.errors[i].actions));
   }
   for (var i = 0; i < (state.pendingDiffs || []).length; i++) {
     chunks.push(renderPendingDiff(state.pendingDiffs[i]));
@@ -626,8 +626,17 @@ function renderPendingDiff(diff) {
 }
 
 /* ── Error card ── */
-function renderErrorCard(message) {
-  return '<div class="error-card">' + escapeHtml(message) + '</div>';
+function renderErrorCard(message, actions) {
+  var html = '<div class="error-card">' + escapeHtml(message);
+  if (actions && actions.length > 0) {
+    html += '<div class="error-actions">';
+    for (var ai = 0; ai < actions.length; ai++) {
+      html += '<button class="error-action-btn" data-action="' + escapeAttr(actions[ai].action) + '">' + escapeHtml(actions[ai].label) + '</button>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+  return html;
 }
 
 /* ── Collapsible helper ── */

@@ -7,12 +7,18 @@ export interface TimelineMessage {
     parts: MessagePart[];
 }
 
+export interface TimelineErrorAction {
+    label: string;
+    action: string; // action type to postMessage
+}
+
 export interface TimelineError {
     id: string;
     sessionID?: string;
     message: string;
     error?: unknown;
     time: number;
+    actions?: TimelineErrorAction[];
 }
 
 export interface TimelineDiff {
@@ -215,13 +221,14 @@ export class TimelineStore {
         return diff;
     }
 
-    addError(input: { sessionID?: string; message: string; error?: unknown }): TimelineError {
+    addError(input: { sessionID?: string; message: string; error?: unknown; actions?: TimelineErrorAction[] }): TimelineError {
         const error: TimelineError = {
             id: `error_${Date.now()}_${this._errors.length}`,
             sessionID: input.sessionID,
             message: input.message,
             error: input.error,
-            time: Date.now()
+            time: Date.now(),
+            actions: input.actions
         };
         this._errors.push(error);
         return error;

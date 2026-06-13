@@ -400,6 +400,27 @@ body {
   line-height: 1.4;
   margin: 4px 0;
 }
+.error-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.error-action-btn {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 3px;
+  border: 1px solid var(--vscode-inputValidation-errorBorder);
+  background: transparent;
+  color: var(--vscode-errorForeground);
+  cursor: pointer;
+  line-height: 1.4;
+  transition: all 0.15s;
+}
+.error-action-btn:hover {
+  background: var(--vscode-inputValidation-errorBorder);
+  color: var(--vscode-button-foreground);
+}
 
 /* ── Diff card ── */
 .diff-card {
