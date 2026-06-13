@@ -610,7 +610,7 @@ export class ApiClient {
         return this.request('POST', `/provider/${encodeURIComponent(providerID)}/oauth/callback`, input);
     }
 
-    async getAgents(): Promise<Array<{ name: string; description?: string; [key: string]: unknown }>> {
+    async getAgents(): Promise<Array<{ name: string; description?: string; mode?: string; hidden?: boolean; [key: string]: unknown }>> {
         return this.request('GET', '/agent');
     }
 

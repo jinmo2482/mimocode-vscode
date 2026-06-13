@@ -41,6 +41,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     private _disposables: vscode.Disposable[] = [];
     private _busy = false;
     private _currentAgent?: string; // synced from backend user messages (e.g. "build" after plan_exit Yes)
+    private _agents: Array<{ name: string; description?: string; mode?: string; hidden?: boolean }> = [];
     private _onSignInRequest?: () => void;
     private _pendingQuestions = new Map<string, string>(); // sessionID+callID -> requestID (for answer lookup)
     private _pendingQuestionRequests = new Map<string, PendingQuestionRequest>(); // requestID -> full request
@@ -171,13 +172,15 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     }
 
     private async loadConfigAndProviders(): Promise<void> {
-        const [config, globalConfig, providers] = await Promise.all([
+        const [config, globalConfig, providers, agents] = await Promise.all([
             this._apiClient.getConfig().catch(() => ({} as ConfigInfo)),
             this._apiClient.getGlobalConfig().catch(() => ({} as ConfigInfo)),
-            this._apiClient.getProviders().catch(() => undefined)
+            this._apiClient.getProviders().catch(() => undefined),
+            this._apiClient.getAgents().catch(() => [])
         ]);
         this._config = config;
         this._providers = providers;
+        this._agents = agents;
 
         // Model is stored in global config. GET /config returns merged (global+project),
         // but if model was never set, it may be absent from both.
@@ -885,7 +888,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             models: this._models,
             variant: this._currentVariant,
             variantOptions: this._variantOptions,
-            currentAgent: this._currentAgent
+            currentAgent: this._currentAgent,
+            agents: this._agents
         });
     }
 

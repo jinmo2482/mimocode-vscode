@@ -1,10 +1,12 @@
 export function getScript(): string {
     return String.raw`
 var vscode = acquireVsCodeApi();
-var state = { sessions: [], currentSessionId: null, busy: false, sseState: 'disconnected', model: undefined, agentMode: 'build', models: [], variant: undefined, variantOptions: [] };
+var state = { sessions: [], currentSessionId: null, busy: false, sseState: 'disconnected', model: undefined, agentMode: 'build', models: [], variant: undefined, variantOptions: [], agents: [] };
 var timeline = { messages: [], diffs: [], errors: [] };
 // Track staged answers for multi-question requests: cardId -> answer[]
 var questionSelections = {};
+// Show Details toggle (persisted in localStorage)
+var showDetails = localStorage.getItem('mimocode-showDetails') === 'true';
 
 var els = {
   statusDot: document.getElementById('status-dot'),
@@ -21,7 +23,8 @@ var els = {
   signInBtn: document.getElementById('sign-in-btn'),
   agentBar: document.getElementById('agent-bar'),
   modelSelect: document.getElementById('model-select'),
-  variantSelect: document.getElementById('variant-select')
+  variantSelect: document.getElementById('variant-select'),
+  detailsToggle: document.getElementById('details-toggle')
 };
 
 /* ── Auto-grow textarea ── */
@@ -43,6 +46,16 @@ els.agentBar.addEventListener('click', function(e) {
     pills[i].classList.toggle('active', pills[i].getAttribute('data-agent') === mode);
   }
 });
+
+/* ── Show Details toggle ── */
+els.detailsToggle.addEventListener('click', function() {
+  showDetails = !showDetails;
+  localStorage.setItem('mimocode-showDetails', String(showDetails));
+  els.detailsToggle.classList.toggle('active', showDetails);
+  renderTimeline();
+});
+// Initialize Details button state
+if (showDetails) els.detailsToggle.classList.add('active');
 
 /* ── Model / variant selectors ── */
 els.modelSelect.addEventListener('change', function() {
@@ -235,16 +248,45 @@ function sendPrompt() {
   autoGrow();
 }
 
+/* ── Dynamic agent pills ── */
+function renderAgentPills() {
+  var agents = (state.agents || []).filter(function(a) {
+    return a.mode !== 'subagent' && !a.hidden;
+  });
+  // Ensure current agentMode is valid
+  if (agents.length > 0 && !agents.some(function(a) { return a.name === state.agentMode; })) {
+    state.agentMode = agents[0].name;
+  }
+  // Only re-render if agents changed
+  var key = agents.map(function(a) { return a.name; }).join(',');
+  if (els.agentBar.getAttribute('data-agents-key') === key) {
+    // Just update active state
+    var pills = els.agentBar.querySelectorAll('.agent-pill');
+    for (var i = 0; i < pills.length; i++) {
+      pills[i].classList.toggle('active', pills[i].getAttribute('data-agent') === state.agentMode);
+    }
+    return;
+  }
+  els.agentBar.setAttribute('data-agents-key', key);
+  els.agentBar.innerHTML = '';
+  for (var i = 0; i < agents.length; i++) {
+    var a = agents[i];
+    var btn = document.createElement('button');
+    btn.className = 'agent-pill' + (a.name === state.agentMode ? ' active' : '');
+    btn.setAttribute('data-agent', a.name);
+    btn.textContent = a.name;
+    btn.title = a.description || a.name;
+    els.agentBar.appendChild(btn);
+  }
+}
+
 /* ── Shell / header render ── */
 function renderShell() {
   var status = state.sseState || 'disconnected';
   els.statusDot.className = 'status-dot ' + status;
 
-  // Sync agent pill active state from state.agentMode
-  var agentPills = els.agentBar.querySelectorAll('.agent-pill');
-  for (var i = 0; i < agentPills.length; i++) {
-    agentPills[i].classList.toggle('active', agentPills[i].getAttribute('data-agent') === state.agentMode);
-  }
+  // Render dynamic agent pills from backend
+  renderAgentPills();
 
   var providers = state.providers;
   var connected = providers && providers.connected && providers.connected.length > 0;
@@ -470,8 +512,8 @@ function renderMessageError(info) {
   return renderErrorCard(errMsg);
 }
 
-/* ── Debug flag: set to true to show all parts (step-start, step-finish, etc.) ── */
-var SHOW_DETAILS = false;
+/* ── Debug flag: controlled by Details toggle button ── */
+// showDetails is declared at top, persisted in localStorage
 
 /* ── Part routing (aligned with TUI PART_MAPPING: text, tool, reasoning only) ── */
 function renderPart(part) {
@@ -491,35 +533,35 @@ function renderPart(part) {
       }
       return renderTool(part);
     case 'step-start':
-      if (SHOW_DETAILS) return renderStepStart(part);
+      if (showDetails) return renderStepStart(part);
       return '';
     case 'step-finish':
-      if (SHOW_DETAILS) return renderStepFinish(part);
+      if (showDetails) return renderStepFinish(part);
       return '';
     case 'retry':
       return renderRetry(part);
     case 'patch':
-      if (SHOW_DETAILS) return renderPatch(part);
+      if (showDetails) return renderPatch(part);
       return '';
     case 'file':
       return renderFile(part);
     case 'agent':
-      if (SHOW_DETAILS) return renderAgentCard(part);
+      if (showDetails) return renderAgentCard(part);
       return '';
     case 'subtask':
-      if (SHOW_DETAILS) return renderSubtask(part);
+      if (showDetails) return renderSubtask(part);
       return '';
     case 'checkpoint':
-      if (SHOW_DETAILS) return renderCheckpoint(part);
+      if (showDetails) return renderCheckpoint(part);
       return '';
     case 'compaction':
-      if (SHOW_DETAILS) return renderCompaction(part);
+      if (showDetails) return renderCompaction(part);
       return '';
     case 'snapshot':
-      if (SHOW_DETAILS) return renderSnapshot(part);
+      if (showDetails) return renderSnapshot(part);
       return '';
     default:
-      if (SHOW_DETAILS) return renderCollapsible(part.type || 'part', JSON.stringify(part, null, 2), 'part');
+      if (showDetails) return renderCollapsible(part.type || 'part', JSON.stringify(part, null, 2), 'part');
       return '';
   }
 }
@@ -543,7 +585,7 @@ function renderTool(part) {
   var toolName = part.tool || 'tool';
 
   // Hide completed tools with no error (TUI: shouldHide when showDetails=false)
-  if (!SHOW_DETAILS && status === 'completed' && !s.error) {
+  if (!showDetails && status === 'completed' && !s.error) {
     return '';
   }
 

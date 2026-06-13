@@ -38,12 +38,9 @@ export function getHtml(webview: vscode.Webview): string {
     <main id="timeline" class="timeline"></main>
     <section id="mentions" class="mentions hidden"></section>
     <footer class="composer">
-        <div class="agent-bar" id="agent-bar">
-            <button class="agent-pill active" data-agent="build">build</button>
-            <button class="agent-pill" data-agent="plan">plan</button>
-            <button class="agent-pill" data-agent="compose">compose</button>
-        </div>
+        <div class="agent-bar" id="agent-bar"></div>
         <div class="control-row" id="control-row">
+            <button class="details-toggle" id="details-toggle" title="Show/hide tool details">Details</button>
             <label class="control-label">Model
                 <select id="model-select" class="control-select"></select>
             </label>
