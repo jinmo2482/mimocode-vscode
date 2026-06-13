@@ -151,14 +151,32 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     }
 
     private async loadConfigAndProviders(): Promise<void> {
-        const [config, providers] = await Promise.all([
+        const [config, globalConfig, providers] = await Promise.all([
             this._apiClient.getConfig().catch(() => ({} as ConfigInfo)),
+            this._apiClient.getGlobalConfig().catch(() => ({} as ConfigInfo)),
             this._apiClient.getProviders().catch(() => undefined)
         ]);
         this._config = config;
         this._providers = providers;
-        this._currentModel = typeof config.model === 'string' ? config.model : undefined;
+
+        // Debug: log raw config
+        console.log('[MiMoCode] raw /config', config);
+        console.log('[MiMoCode] raw /global/config', globalConfig);
+        if (providers) {
+            console.log('[MiMoCode] raw /provider connected', providers.connected);
+            console.log('[MiMoCode] raw /provider all provider ids', (providers.all || []).map((p: any) => p.id || p.name));
+        }
+
+        // Model is stored in global config. GET /config returns merged (global+project),
+        // but if model was never set, it may be absent from both.
+        this._currentModel = getConfigModel(config) || getConfigModel(globalConfig);
         this._effectiveModelRef = normalizeModelRef(this._currentModel);
+
+        if (!this._currentModel) {
+            console.warn('[MiMoCode] No model found in /config or /global/config. Model select will show empty.');
+        } else {
+            console.log('[MiMoCode] current model resolved:', this._currentModel);
+        }
 
         // Compute models list — filter to connected providers only
         if (providers) {
@@ -581,27 +599,39 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
 
     /**
      * Public: set the current model. Called from webview or command palette.
-     * Verifies the change took effect after PATCH /config.
+     * Model is stored in global config via PATCH /global/config.
      */
     async setModel(modelRef: string): Promise<void> {
         if (!modelRef) return;
         console.log(`[MiMoCode] setting model to ${modelRef}`);
         try {
-            await this._apiClient.setModel(modelRef);
+            const updated = await this._apiClient.setModel(modelRef);
+            console.log('[MiMoCode] setModel PATCH result:', updated);
+
             await this.loadConfigAndProviders();
 
-            // Verify the model actually changed
+            // Verify: read back from config
             const effective = normalizeModelRef(this._currentModel);
-            if (effective !== normalizeModelRef(modelRef)) {
+            console.log('[MiMoCode] setModel verification', {
+                requested: modelRef,
+                effective,
+                rawReloadedConfig: this._config
+            });
+
+            if (effective === normalizeModelRef(modelRef)) {
+                console.log('[MiMoCode] Model set and verified', { modelRef });
+            } else if (!effective) {
+                console.warn('[MiMoCode] Model update returned successfully, but current model could not be read from /config.');
+                // Still update local state so the UI shows the selected model
+                this._currentModel = modelRef;
+                this._effectiveModelRef = normalizeModelRef(modelRef);
+            } else {
                 this.showError(
-                    `Model did not change to ${modelRef}. Current model is ${this._currentModel || 'unknown'}. ` +
-                    `MiMoCode server may have rejected or ignored the config update.`
+                    `Model update did not persist. Requested: ${modelRef}, current: ${effective}.`
                 );
-                this.postShellState();
-                return;
             }
 
-            console.log('[MiMoCode] Model set and verified', { modelRef });
+            this.updateVariantOptions();
             this.postShellState();
         } catch (err) {
             const msg = toMessage(err);
@@ -804,6 +834,20 @@ function toMessage(error: unknown): string {
         return error;
     }
     return JSON.stringify(error);
+}
+
+/**
+ * Extract the current model from a config object.
+ * Tries multiple paths to handle different config structures.
+ */
+function getConfigModel(config: ConfigInfo): string | undefined {
+    if (typeof config.model === 'string' && config.model.trim()) {
+        return config.model.trim();
+    }
+    if (typeof (config as any).modelRef === 'string' && (config as any).modelRef.trim()) {
+        return (config as any).modelRef.trim();
+    }
+    return undefined;
 }
 
 function normalizeModelRef(model: string | undefined): string | undefined {

@@ -542,6 +542,10 @@ export class ApiClient {
         return this.request('PATCH', '/global/config', config);
     }
 
+    async getGlobalConfig(): Promise<ConfigInfo> {
+        return this.request('GET', '/global/config');
+    }
+
     async getProviders(): Promise<ProviderListResult> {
         return this.request('GET', '/provider');
     }
@@ -589,8 +593,10 @@ export class ApiClient {
     }
 
     async setModel(modelRef: string): Promise<ConfigInfo> {
-        const config = await this.getConfig();
-        return this.updateConfig({ ...config, model: modelRef });
+        // Model is stored in global config, not project config.
+        // PATCH /config does NOT persist model; PATCH /global/config does.
+        const globalConfig = await this.getGlobalConfig();
+        return this.updateGlobalConfig({ ...globalConfig, model: modelRef });
     }
 
     normalizeModels(result: ProviderListResult): Array<{ label: string; description?: string; providerID: string; modelID: string }> {
