@@ -177,6 +177,32 @@ els.timeline.addEventListener('click', function(event) {
     return;
   }
 
+  // Handle custom/other option: show text input instead of submitting
+  if (action === 'answerQuestionCustom') {
+    var qCard4 = button.closest('.question-card');
+    if (!qCard4) return;
+    var qIdx4 = parseInt(button.getAttribute('data-q-index') || '0', 10);
+    // Find the custom input container for this question index
+    var customInput = qCard4.querySelector('.question-custom-input[data-q-index="' + qIdx4 + '"]');
+    if (customInput) {
+      customInput.style.display = '';
+      var textEl = customInput.querySelector('.question-input');
+      if (textEl) textEl.focus();
+    }
+    // Mark this option as selected visually
+    button.classList.add('question-opt-selected');
+    // For single question: disable other options to prevent double-submit
+    var isSingle4 = qCard4.getAttribute('data-single') === '1';
+    if (isSingle4) {
+      var otherBtns = qCard4.querySelectorAll('.question-opt-btn:not(.question-custom-btn)');
+      for (var bi4 = 0; bi4 < otherBtns.length; bi4++) {
+        otherBtns[bi4].disabled = true;
+        otherBtns[bi4].classList.add('question-opt-disabled');
+      }
+    }
+    return;
+  }
+
   // Handle question text input (for custom answers)
   if (action === 'answerQuestionInput') {
     var qCard2 = button.closest('.question-card');
@@ -701,6 +727,11 @@ function renderQuestionTool(part) {
 
   // Answered questions: collapsed one-liner (TUI: InlineTool "Asked N questions")
   if (answered) {
+    // Error status always visible; completed hidden when showDetails=false
+    if (status === 'error') {
+      return '<div class="inline-tool inline-tool-error"><span class="inline-tool-icon">&#x2717;</span> <span class="inline-tool-label">Question failed</span></div>';
+    }
+    if (!showDetails) return '';
     var count = questions.length || 0;
     var answers = s.metadata && s.metadata.answers;
     var answerSummary = '';
@@ -774,9 +805,20 @@ function renderQuestionTool(part) {
         var optValue = typeof opt === 'object' ? (opt.label || opt.value || '') : opt;
         chunks.push('<button class="question-opt-btn" data-action="answerQuestion" data-answer="' + escapeAttr(optValue) + '" data-q-index="' + qi + '">' + escapeHtml(optLabel) + (optDesc ? '<span class="question-opt-desc">' + escapeHtml(optDesc) + '</span>' : '') + '</button>');
       }
+      // Implicit custom/other option (TUI: custom !== false adds "other" at end)
+      if (q.custom !== false) {
+        chunks.push('<button class="question-opt-btn question-custom-btn" data-action="answerQuestionCustom" data-q-index="' + qi + '">Other...</button>');
+      }
       chunks.push('</div>');
+      // Custom text input container (hidden until custom option is clicked)
+      if (q.custom !== false) {
+        chunks.push('<div class="question-text-input question-custom-input" data-q-index="' + qi + '" style="display:none">');
+        chunks.push('<input type="text" class="question-input" placeholder="Type your answer..." data-q-index="' + qi + '" />');
+        chunks.push('<button class="question-submit-btn" data-action="answerQuestionInput">Submit</button>');
+        chunks.push('</div>');
+      }
     } else if (q.custom !== false) {
-      // Free-text input (custom defaults to true)
+      // Free-text input (custom defaults to true, no predefined options)
       chunks.push('<div class="question-text-input">');
       chunks.push('<input type="text" class="question-input" placeholder="Type your answer..." data-q-index="' + qi + '" />');
       chunks.push('<button class="question-submit-btn" data-action="answerQuestionInput">Submit</button>');
@@ -854,7 +896,16 @@ function renderPendingQuestionRequest(req) {
         var optValue = typeof opt === 'object' ? (opt.label || opt.value || '') : opt;
         chunks.push('<button class="question-opt-btn" data-action="answerQuestion" data-answer="' + escapeAttr(optValue) + '" data-q-index="' + qi + '">' + escapeHtml(optLabel) + (optDesc ? '<span class="question-opt-desc">' + escapeHtml(optDesc) + '</span>' : '') + '</button>');
       }
+      if (q.custom !== false) {
+        chunks.push('<button class="question-opt-btn question-custom-btn" data-action="answerQuestionCustom" data-q-index="' + qi + '">Other...</button>');
+      }
       chunks.push('</div>');
+      if (q.custom !== false) {
+        chunks.push('<div class="question-text-input question-custom-input" data-q-index="' + qi + '" style="display:none">');
+        chunks.push('<input type="text" class="question-input" placeholder="Type your answer..." data-q-index="' + qi + '" />');
+        chunks.push('<button class="question-submit-btn" data-action="answerQuestionInput">Submit</button>');
+        chunks.push('</div>');
+      }
     } else if (q.custom !== false) {
       chunks.push('<div class="question-text-input">');
       chunks.push('<input type="text" class="question-input" placeholder="Type your answer..." data-q-index="' + qi + '" />');
@@ -1052,6 +1103,9 @@ function renderPendingDiff(diff) {
 
 /* ── Synthetic context chip (e.g. "Current file: @/path") ── */
 function renderSyntheticContext(text) {
+  // Hide system-reminder content
+  text = stripSystemReminder(text);
+  if (!text) return '';
   // Extract file path from patterns like "Current file: @/absolute/path" or "Selection from @path#L1-5:"
   var fileMatch = text.match(/Current file: @(.+?)$/);
   if (fileMatch) {
@@ -1193,10 +1247,15 @@ function mapFiles(files) {
   }
   return out;
 }
-/** Strip <system-reminder>...</system-reminder> blocks from text. */
+/** Strip <system-reminder>...</system-reminder> blocks from text.
+ *  Handles raw tags, HTML-escaped variants, and tags with attributes. */
 function stripSystemReminder(text) {
   if (!text) return '';
-  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
+  // Raw tags (with optional attributes)
+  text = text.replace(/<system-reminder[^>]*>[\s\S]*?<\/system-reminder>/g, '');
+  // HTML-escaped tags
+  text = text.replace(/&lt;system-reminder[^&]*&gt;[\s\S]*?&lt;\/system-reminder&gt;/g, '');
+  return text.trim();
 }
 function escapeHtml(value) {
   return String(value == null ? '' : value).replace(/[&<>"]/g, function(ch) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[ch]; });

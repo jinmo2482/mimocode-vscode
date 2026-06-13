@@ -742,6 +742,13 @@ body {
   opacity: 0.5;
   cursor: default !important;
 }
+.question-custom-btn {
+  font-style: italic;
+  opacity: 0.8;
+}
+.question-custom-input {
+  padding: 2px 8px 2px 30px;
+}
 
 /* ── Reasoning summary (collapsed Thought line) ── */
 .reasoning-summary {
