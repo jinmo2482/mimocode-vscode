@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
 import { ApiClient, ApiError, ConfigInfo, PromptOptions, SessionInfo, SessionStatusInfo, generateMessageID } from '../api/client';
 import { SseClient, SseEvent } from '../api/sseClient';
 import { EditorContext } from '../context/editorContext';
@@ -39,6 +40,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     private _timeline = new TimelineStore();
     private _disposables: vscode.Disposable[] = [];
     private _busy = false;
+    private _currentAgent?: string; // synced from backend user messages (e.g. "build" after plan_exit Yes)
     private _onSignInRequest?: () => void;
     private _pendingQuestions = new Map<string, string>(); // sessionID+callID -> requestID (for answer lookup)
     private _pendingQuestionRequests = new Map<string, PendingQuestionRequest>(); // requestID -> full request
@@ -260,6 +262,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             this._pendingQuestions.clear();
             this._pendingQuestionRequests.clear();
             this._errorDedup.clear();
+            this._currentAgent = undefined;
             this._currentSessionId = sessionId;
             const [session, messages, statuses] = await Promise.all([
                 this._apiClient.getSession(sessionId),
@@ -562,27 +565,66 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
 
     /**
      * Open a plan file in the VS Code editor.
-     * Resolves relative paths against the workspace root.
+     * MiMoCode plan paths are relative to the worktree, not the VS Code workspace.
+     * We try multiple candidates and open the first one that exists on disk.
      */
     private async handleOpenPlanFile(planPath: string): Promise<void> {
         if (!planPath) return;
+
+        const workspaceRoot = this._editorContext.getWorkspaceRoot();
+        const candidates: string[] = [];
+
+        // 1. Absolute path as-is
+        if (path.isAbsolute(planPath)) {
+            candidates.push(planPath);
+        }
+
+        // 2. If looks like home-relative (e.g. "home/jm/.local/..." missing leading /)
+        if (!path.isAbsolute(planPath) && /^home\/|^Users\//.test(planPath)) {
+            candidates.push('/' + planPath);
+        }
+
+        // 3-6. Try MiMoCode paths
         try {
-            let uri: vscode.Uri;
-            if (path.isAbsolute(planPath)) {
-                uri = vscode.Uri.file(planPath);
-            } else {
-                // Try workspace root first
-                const workspaceRoot = this._editorContext.getWorkspaceRoot();
-                if (workspaceRoot) {
-                    uri = vscode.Uri.file(path.join(workspaceRoot, planPath));
-                } else {
-                    uri = vscode.Uri.file(planPath);
+            const mimoPath = await this._apiClient.getPath();
+            if (mimoPath) {
+                // 3. Relative to worktree
+                if (mimoPath.worktree) {
+                    candidates.push(path.resolve(mimoPath.worktree, planPath));
+                }
+                // 4. Relative to directory
+                if (mimoPath.directory) {
+                    candidates.push(path.resolve(mimoPath.directory, planPath));
+                }
+                // 5. state/plans/basename
+                if (mimoPath.state) {
+                    candidates.push(path.join(mimoPath.state, 'plans', path.basename(planPath)));
                 }
             }
-            await vscode.window.showTextDocument(uri);
-        } catch (err) {
-            this.showError(`Failed to open plan file: ${planPath} — ${toMessage(err)}`);
+        } catch {
+            // getPath failed — continue with remaining candidates
         }
+
+        // 6. Relative to workspace root
+        if (workspaceRoot) {
+            candidates.push(path.resolve(workspaceRoot, planPath));
+        }
+
+        // Try candidates in order
+        for (const candidate of candidates) {
+            try {
+                if (fs.existsSync(candidate)) {
+                    const uri = vscode.Uri.file(candidate);
+                    await vscode.window.showTextDocument(uri);
+                    return;
+                }
+            } catch {
+                // continue
+            }
+        }
+
+        // None found — show error with all candidates for debugging
+        this.showError(`Plan file not found. Tried: ${candidates.join(', ')}`);
     }
 
     /**
@@ -796,9 +838,14 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         // When a new assistant message completes successfully (no error),
         // clear stale model/provider error cards — the issue is resolved.
         if (event.type === 'message.updated') {
-            const info = event.properties?.info as { role?: string; error?: unknown } | undefined;
+            const info = event.properties?.info as { role?: string; agent?: string; error?: unknown } | undefined;
             if (info?.role === 'assistant' && !info.error) {
                 this._timeline.clearModelProviderErrors(sessionID);
+            }
+            // Sync agent from user messages (captures plan_exit Yes → build)
+            if (info?.role === 'user' && info.agent && sessionID === this._currentSessionId) {
+                this._currentAgent = info.agent;
+                this.postShellState();
             }
         }
 
@@ -837,7 +884,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             model: this._effectiveModelRef || this._currentModel,
             models: this._models,
             variant: this._currentVariant,
-            variantOptions: this._variantOptions
+            variantOptions: this._variantOptions,
+            currentAgent: this._currentAgent
         });
     }
 

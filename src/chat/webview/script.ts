@@ -60,6 +60,10 @@ window.addEventListener('message', function(event) {
   switch (msg.type) {
     case 'shellState':
       state = Object.assign({}, state, msg);
+      // Sync agent pill from backend (e.g. plan_exit Yes → build)
+      if (msg.currentAgent && msg.currentAgent !== state.agentMode) {
+        state.agentMode = msg.currentAgent;
+      }
       renderShell();
       break;
     case 'timelineSnapshot':
@@ -235,6 +239,12 @@ function sendPrompt() {
 function renderShell() {
   var status = state.sseState || 'disconnected';
   els.statusDot.className = 'status-dot ' + status;
+
+  // Sync agent pill active state from state.agentMode
+  var agentPills = els.agentBar.querySelectorAll('.agent-pill');
+  for (var i = 0; i < agentPills.length; i++) {
+    agentPills[i].classList.toggle('active', agentPills[i].getAttribute('data-agent') === state.agentMode);
+  }
 
   var providers = state.providers;
   var connected = providers && providers.connected && providers.connected.length > 0;
