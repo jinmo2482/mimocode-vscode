@@ -215,7 +215,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     if (config.server.autoStart) {
         await serverManager.start();
-        sseClient.connect(serverManager.baseUrl);
+        // sseClient.connect is handled by serverManager.onStateChange(Running) above
     }
 }
 

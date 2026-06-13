@@ -378,6 +378,7 @@ function renderPart(part) {
   if (!part) return '';
   switch (part.type) {
     case 'text':
+      if (part.synthetic) return renderSyntheticContext(part.text || '');
       return '<div class="part text">' + renderMarkdown(part.text || '') + '</div>';
     case 'reasoning':
       return renderCollapsible('Reasoning', part.text || '', 'part');
@@ -623,6 +624,29 @@ function renderPendingDiff(diff) {
       '<button data-action="rejectDiff" data-diff-id="' + escapeAttr(diff.id) + '">Reject</button>' +
     '</div>' +
   '</div>';
+}
+
+/* ── Synthetic context chip (e.g. "Current file: @/path") ── */
+function renderSyntheticContext(text) {
+  // Extract file path from patterns like "Current file: @/absolute/path" or "Selection from @path#L1-5:"
+  var fileMatch = text.match(/Current file: @(.+?)$/);
+  if (fileMatch) {
+    var fullPath = fileMatch[1].trim();
+    var basename = fullPath.split(/[\\/]/).pop() || fullPath;
+    // Try to show workspace-relative path
+    var relPath = fullPath;
+    var workspaceMatch = fullPath.match(/(?:^|\/)([^/]+\/.+)$/);
+    if (workspaceMatch) relPath = workspaceMatch[1];
+    return '<div class="context-chip" title="' + escapeAttr(fullPath) + '">&#x1F4C4; ' + escapeHtml(basename) + '</div>';
+  }
+  var selMatch = text.match(/Selection from @(.+?)(?:#|$)/);
+  if (selMatch) {
+    var selPath = selMatch[1].trim();
+    var selBasename = selPath.split(/[\\/]/).pop() || selPath;
+    return '<div class="context-chip" title="' + escapeAttr(selPath) + '">&#x1F4CB; ' + escapeHtml(selBasename) + '</div>';
+  }
+  // Fallback: render as compact text
+  return '<div class="context-chip">' + escapeHtml(truncate(text, 80)) + '</div>';
 }
 
 /* ── Error card ── */

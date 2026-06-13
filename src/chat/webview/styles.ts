@@ -389,6 +389,24 @@ body {
   opacity: 0.6;
 }
 
+/* ── Context chip (synthetic file/selection context) ── */
+.context-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  background: var(--vscode-badge-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 99px;
+  padding: 1px 8px;
+  margin: 2px 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ── Error card ── */
 .error-card {
   border-left: 3px solid var(--vscode-inputValidation-errorBorder);

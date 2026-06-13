@@ -24,7 +24,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     private _disposables: vscode.Disposable[] = [];
     private _busy = false;
     private _onSignInRequest?: () => void;
-    private _pendingQuestions = new Map<string, string>(); // callID -> requestID
+    private _pendingQuestions = new Map<string, string>(); // sessionID+callID -> requestID
+    private _errorDedup = new Map<string, number>(); // message -> lastShown timestamp
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -159,24 +160,10 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         this._config = config;
         this._providers = providers;
 
-        // Debug: log raw config
-        console.log('[MiMoCode] raw /config', config);
-        console.log('[MiMoCode] raw /global/config', globalConfig);
-        if (providers) {
-            console.log('[MiMoCode] raw /provider connected', providers.connected);
-            console.log('[MiMoCode] raw /provider all provider ids', (providers.all || []).map((p: any) => p.id || p.name));
-        }
-
         // Model is stored in global config. GET /config returns merged (global+project),
         // but if model was never set, it may be absent from both.
         this._currentModel = getConfigModel(config) || getConfigModel(globalConfig);
         this._effectiveModelRef = normalizeModelRef(this._currentModel);
-
-        if (!this._currentModel) {
-            console.warn('[MiMoCode] No model found in /config or /global/config. Model select will show empty.');
-        } else {
-            console.log('[MiMoCode] current model resolved:', this._currentModel);
-        }
 
         // Compute models list — filter to connected providers only
         if (providers) {
@@ -188,7 +175,6 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                 this._models = connectedModels;
             } else {
                 this._models = allModels;
-                console.warn('[MiMoCode] No connected provider models; showing all models as fallback.');
             }
 
             // Ensure current configured model is in the list even if not in connected providers
@@ -199,26 +185,6 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                     providerID: this._currentModel.split('/')[0] || '',
                     modelID: this._currentModel.split('/').slice(1).join('/')
                 });
-            }
-
-            // Debug: log raw model info for current model
-            if (this._currentModel) {
-                const [pid, ...rest] = this._currentModel.split('/');
-                const mid = rest.join('/');
-                for (const provider of providers.all || []) {
-                    const pvid = provider.id || (provider as any).providerID || provider.name;
-                    if (pvid !== pid) continue;
-                    const rawModels = provider.models || [];
-                    const entries: [string, any][] = Array.isArray(rawModels)
-                        ? rawModels.map((m: any) => [m.id, m])
-                        : Object.entries(rawModels);
-                    for (const [mId, mObj] of entries) {
-                        if (mId === mid) {
-                            console.log('[MiMoCode] current model raw provider info', { model: this._currentModel, rawModel: mObj });
-                            break;
-                        }
-                    }
-                }
             }
 
             // Update variant options for current model
@@ -273,6 +239,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                 }
             }
 
+            // Clear pending question mappings when switching sessions
+            this._pendingQuestions.clear();
+            this._errorDedup.clear();
             this._currentSessionId = sessionId;
             const [session, messages, statuses] = await Promise.all([
                 this._apiClient.getSession(sessionId),
@@ -432,11 +401,6 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         // Always go through ensureSession() so workspace directory is validated;
         // do not trust any sessionId from the webview directly.
         const sid = await this.ensureSession();
-
-        const workspaceRoot = this._editorContext.getWorkspaceRoot();
-        const currentSession = this._sessions.find(s => s.id === sid);
-        console.log(`[MiMoCode] sendPrompt: workspaceRoot=${workspaceRoot}, sid=${sid}, session.directory=${currentSession?.directory}`);
-
         const context = this._editorContext.gatherContext();
         const promptOptions = this.getPromptOptions(agent);
         this._busy = true;
@@ -539,19 +503,11 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         }
 
         const sid = payload.sessionId || this._currentSessionId;
-        console.log('[MiMoCode] answerQuestion received', {
-            answer: payload.answer,
-            sessionId: payload.sessionId,
-            messageId: payload.messageId,
-            toolCallId: payload.toolCallId,
-            requestID: payload.requestID,
-            currentSessionId: this._currentSessionId
-        });
 
-        // Resolve requestID: from payload, from pending map, or try fetching
+        // Resolve requestID: from payload, from pending map (session-scoped), or try fetching
         let requestID = payload.requestID;
-        if (!requestID && payload.toolCallId) {
-            requestID = this._pendingQuestions.get(payload.toolCallId);
+        if (!requestID && payload.toolCallId && sid) {
+            requestID = this._pendingQuestions.get(`${sid}:${payload.toolCallId}`);
         }
         if (!requestID) {
             requestID = await this.findPendingQuestionRequestID(sid);
@@ -560,24 +516,20 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         if (requestID) {
             try {
                 await this._apiClient.answerQuestion(requestID, [[payload.answer]]);
-                console.log('[MiMoCode] question answer sent via /question/:requestID/reply', { requestID, answers: [[payload.answer]] });
                 // Clean up pending map
-                if (payload.toolCallId) {
-                    this._pendingQuestions.delete(payload.toolCallId);
+                if (payload.toolCallId && sid) {
+                    this._pendingQuestions.delete(`${sid}:${payload.toolCallId}`);
                 }
                 return;
-            } catch (err) {
-                console.warn('[MiMoCode] /question/:requestID/reply failed, trying appendTuiPrompt fallback', err);
+            } catch {
+                // Fall through to appendTuiPrompt
             }
-        } else {
-            console.warn('[MiMoCode] No requestID found for question answer, using appendTuiPrompt fallback');
         }
 
         // Fallback: appendTuiPrompt
         try {
             await this._apiClient.appendTuiPrompt(payload.answer + '\n');
-            console.log('[MiMoCode] question answer sent via appendTuiPrompt fallback');
-        } catch (err) {
+        } catch {
             this.showError('Failed to answer MiMoCode question. The headless question answer protocol may be unsupported.');
         }
     }
@@ -588,11 +540,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
      */
     private async findPendingQuestionRequestID(sessionId?: string): Promise<string | undefined> {
         try {
-            const questions = await (this._apiClient as any).request('GET', '/question') as Array<{
-                id: string;
-                sessionID: string;
-                tool?: { callID?: string };
-            }>;
+            const questions = await this._apiClient.listPendingQuestions();
             if (!Array.isArray(questions) || questions.length === 0) {
                 return undefined;
             }
@@ -601,9 +549,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                 ? questions.find(q => q.sessionID === sessionId) || questions[0]
                 : questions[0];
             if (match) {
-                // Store the mapping for future use
-                if (match.tool?.callID) {
-                    this._pendingQuestions.set(match.tool.callID, match.id);
+                // Store the mapping for future use (session-scoped)
+                if (match.tool?.callID && match.sessionID) {
+                    this._pendingQuestions.set(`${match.sessionID}:${match.tool.callID}`, match.id);
                 }
                 return match.id;
             }
@@ -619,29 +567,17 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
      */
     async setModel(modelRef: string): Promise<void> {
         if (!modelRef) return;
-        console.log(`[MiMoCode] setting model to ${modelRef}`);
         try {
-            const updated = await this._apiClient.setModel(modelRef);
-            console.log('[MiMoCode] setModel PATCH result:', updated);
-
+            await this._apiClient.setModel(modelRef);
             await this.loadConfigAndProviders();
 
             // Verify: read back from config
             const effective = normalizeModelRef(this._currentModel);
-            console.log('[MiMoCode] setModel verification', {
-                requested: modelRef,
-                effective,
-                rawReloadedConfig: this._config
-            });
-
-            if (effective === normalizeModelRef(modelRef)) {
-                console.log('[MiMoCode] Model set and verified', { modelRef });
-            } else if (!effective) {
-                console.warn('[MiMoCode] Model update returned successfully, but current model could not be read from /config.');
-                // Still update local state so the UI shows the selected model
+            if (!effective) {
+                // Config readback empty — trust the PATCH succeeded, update local state
                 this._currentModel = modelRef;
                 this._effectiveModelRef = normalizeModelRef(modelRef);
-            } else {
+            } else if (effective !== normalizeModelRef(modelRef)) {
                 this.showError(
                     `Model update did not persist. Requested: ${modelRef}, current: ${effective}.`
                 );
@@ -669,7 +605,6 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     async setVariant(variant: string | undefined): Promise<void> {
         this._currentVariant = variant || undefined;
         this.postShellState();
-        console.log(`[MiMoCode] Variant set to ${variant || 'default'}`);
     }
 
     /**
@@ -708,22 +643,20 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     }
 
     private handleSseEvent(event: SseEvent): void {
-        // Handle question events regardless of session filter
+        // Handle question events — use session-scoped key (sessionID+callID)
         if (event.type === 'question.asked') {
             const requestID = event.properties?.id as string | undefined;
-            // Defensive: callID may be in different locations depending on server version
+            const sessionID = event.properties?.sessionID as string | undefined;
             const callID =
                 (event.properties?.tool?.callID as string | undefined) ||
                 (event.properties?.callID as string | undefined) ||
                 (event.properties?.part?.callID as string | undefined) ||
                 (event.properties?.toolCallId as string | undefined) ||
                 (event.properties?.toolCallID as string | undefined);
-            console.log('[MiMoCode] question.asked properties', event.properties);
-            if (requestID && callID) {
-                this._pendingQuestions.set(callID, requestID);
-                console.log('[MiMoCode] question.asked captured', { requestID, callID });
-            } else {
-                console.warn('[MiMoCode] question.asked missing requestID or callID', { requestID, callID });
+            // Only track questions for the current session
+            if (requestID && callID && sessionID && sessionID === this._currentSessionId) {
+                const key = `${sessionID}:${callID}`;
+                this._pendingQuestions.set(key, requestID);
             }
             return;
         }
@@ -731,11 +664,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             const requestID =
                 (event.properties?.requestID as string | undefined) ||
                 (event.properties?.id as string | undefined);
-            if (requestID) {
-                // Remove from pending map
-                for (const [callID, rid] of this._pendingQuestions.entries()) {
-                    if (rid === requestID) {
-                        this._pendingQuestions.delete(callID);
+            const sessionID = event.properties?.sessionID as string | undefined;
+            if (requestID && sessionID) {
+                const prefix = `${sessionID}:`;
+                for (const [key, rid] of this._pendingQuestions.entries()) {
+                    if (key.startsWith(prefix) && rid === requestID) {
+                        this._pendingQuestions.delete(key);
                         break;
                     }
                 }
@@ -757,6 +691,34 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         }
 
         const patch = this._timeline.applyEvent(event);
+
+        // Unified model/provider error detection for SSE events
+        if (event.type === 'session.error') {
+            const errMsg = typeof event.properties.error === 'string'
+                ? event.properties.error
+                : (event.properties.error?.message || event.properties.error?.data?.message || JSON.stringify(event.properties.error));
+            if (this.isModelProviderError(errMsg)) {
+                this.showActionableErrorDeduped(`Model / Provider Error: ${errMsg}`, [
+                    { label: 'Change Model', action: 'changeModel' },
+                    { label: 'Refresh Providers', action: 'refreshProviders' },
+                    { label: 'Sign In Provider', action: 'signInProvider' }
+                ], sessionID);
+            }
+        }
+        if (event.type === 'message.updated') {
+            const info = event.properties?.info;
+            if (info?.error) {
+                const errMsg = info.error.message || info.error.name || JSON.stringify(info.error);
+                if (this.isModelProviderError(errMsg)) {
+                    this.showActionableErrorDeduped(`Model / Provider Error: ${errMsg}`, [
+                        { label: 'Change Model', action: 'changeModel' },
+                        { label: 'Refresh Providers', action: 'refreshProviders' },
+                        { label: 'Sign In Provider', action: 'signInProvider' }
+                    ], sessionID, info.id);
+                }
+            }
+        }
+
         if (event.type === 'session.diff' && sessionID) {
             const files = event.properties.diff;
             if (Array.isArray(files) && files.length > 0) {
@@ -848,6 +810,32 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     private showActionableError(message: string, actions: Array<{ label: string; action: string }>): void {
         const error = this._timeline.addError({
             sessionID: this._currentSessionId,
+            message,
+            actions
+        });
+        this.postMessage({ type: 'timelinePatch', patch: { kind: 'error', error } });
+        this.postTimeline();
+    }
+
+    /**
+     * Show an actionable error card with deduplication (5s window).
+     * Prevents the same error from flooding the timeline.
+     */
+    private showActionableErrorDeduped(
+        message: string,
+        actions: Array<{ label: string; action: string }>,
+        sessionID?: string,
+        messageID?: string
+    ): void {
+        const now = Date.now();
+        const lastShown = this._errorDedup.get(message) || 0;
+        if (now - lastShown < 5000) return;
+        this._errorDedup.set(message, now);
+
+        const error = this._timeline.addError({
+            sessionID: sessionID || this._currentSessionId,
+            messageID,
+            source: messageID ? 'message' : 'session',
             message,
             actions
         });

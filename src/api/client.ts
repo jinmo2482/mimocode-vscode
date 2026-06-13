@@ -592,6 +592,10 @@ export class ApiClient {
         return this.request('POST', `/question/${encodeURIComponent(requestID)}/reject`);
     }
 
+    async listPendingQuestions(): Promise<Array<{ id: string; sessionID: string; tool?: { callID?: string } }>> {
+        return this.request('GET', '/question');
+    }
+
     async setModel(modelRef: string): Promise<ConfigInfo> {
         // Model is stored in global config, not project config.
         // PATCH /config does NOT persist model; PATCH /global/config does.
@@ -637,9 +641,7 @@ export class ApiClient {
                 : Object.entries(rawModels);
             for (const [mid, model] of entries) {
                 if (mid !== modelID) continue;
-                const variants = this.extractVariantOptions(model, pid, mid);
-                console.log(`[MiMoCode] Variant options for ${pid}/${mid}:`, variants, 'raw model:', model);
-                return variants;
+                return this.extractVariantOptions(model, pid, mid);
             }
         }
         return [];

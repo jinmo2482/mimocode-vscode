@@ -15,6 +15,8 @@ export interface TimelineErrorAction {
 export interface TimelineError {
     id: string;
     sessionID?: string;
+    messageID?: string;
+    source?: string;
     message: string;
     error?: unknown;
     time: number;
@@ -221,10 +223,12 @@ export class TimelineStore {
         return diff;
     }
 
-    addError(input: { sessionID?: string; message: string; error?: unknown; actions?: TimelineErrorAction[] }): TimelineError {
+    addError(input: { sessionID?: string; messageID?: string; source?: string; message: string; error?: unknown; actions?: TimelineErrorAction[] }): TimelineError {
         const error: TimelineError = {
             id: `error_${Date.now()}_${this._errors.length}`,
             sessionID: input.sessionID,
+            messageID: input.messageID,
+            source: input.source,
             message: input.message,
             error: input.error,
             time: Date.now(),
