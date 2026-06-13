@@ -322,20 +322,43 @@ function renderControls() {
 function renderTimeline() {
   renderShell();
   var chunks = [];
-  if ((!timeline.messages || timeline.messages.length === 0) && (!timeline.errors || timeline.errors.length === 0)) {
+  var messages = timeline.messages || [];
+  var errors = timeline.errors || [];
+  var diffs = timeline.diffs || [];
+  if (messages.length === 0 && errors.length === 0) {
     chunks.push('<div class="empty"><div class="empty-icon">&#x1F4AC;</div><div class="empty-text">Start a conversation with MiMoCode.</div></div>');
   }
-  for (var i = 0; i < (timeline.messages || []).length; i++) {
-    chunks.push(renderMessage(timeline.messages[i]));
+  // Build a map of messageID -> errors for message-level errors
+  var msgErrors = {};
+  var sessionErrors = [];
+  for (var ei = 0; ei < errors.length; ei++) {
+    var err = errors[ei];
+    if (err.messageID) {
+      if (!msgErrors[err.messageID]) msgErrors[err.messageID] = [];
+      msgErrors[err.messageID].push(err);
+    } else {
+      sessionErrors.push(err);
+    }
   }
-  for (var i = 0; i < (timeline.diffs || []).length; i++) {
-    var d = timeline.diffs[i];
+  for (var i = 0; i < messages.length; i++) {
+    chunks.push(renderMessage(messages[i]));
+    // Render message-level errors after the message
+    var mid = messages[i].info && messages[i].info.id;
+    if (mid && msgErrors[mid]) {
+      for (var mi = 0; mi < msgErrors[mid].length; mi++) {
+        chunks.push(renderErrorCard(msgErrors[mid][mi].message, msgErrors[mid][mi].actions));
+      }
+    }
+  }
+  for (var i = 0; i < diffs.length; i++) {
+    var d = diffs[i];
     if (d.files && d.files.length > 0) {
       chunks.push(renderSessionDiff(d));
     }
   }
-  for (var i = 0; i < (timeline.errors || []).length; i++) {
-    chunks.push(renderErrorCard(timeline.errors[i].message, timeline.errors[i].actions));
+  // Session-level errors at the end
+  for (var i = 0; i < sessionErrors.length; i++) {
+    chunks.push(renderErrorCard(sessionErrors[i].message, sessionErrors[i].actions));
   }
   for (var i = 0; i < (state.pendingDiffs || []).length; i++) {
     chunks.push(renderPendingDiff(state.pendingDiffs[i]));

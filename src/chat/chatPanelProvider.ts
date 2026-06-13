@@ -544,9 +544,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             if (!Array.isArray(questions) || questions.length === 0) {
                 return undefined;
             }
-            // Find a question matching the current session
+            // Find a question matching the current session only; never cross sessions
             const match = sessionId
-                ? questions.find(q => q.sessionID === sessionId) || questions[0]
+                ? questions.find(q => q.sessionID === sessionId)
                 : questions[0];
             if (match) {
                 // Store the mapping for future use (session-scoped)
@@ -690,9 +690,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
             return;
         }
 
-        const patch = this._timeline.applyEvent(event);
-
-        // Unified model/provider error detection for SSE events
+        // For session.error: detect model/provider errors BEFORE applying to timeline
+        // so we only show the actionable card, not a duplicate plain error.
         if (event.type === 'session.error') {
             const errMsg = typeof event.properties.error === 'string'
                 ? event.properties.error
@@ -703,8 +702,13 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                     { label: 'Refresh Providers', action: 'refreshProviders' },
                     { label: 'Sign In Provider', action: 'signInProvider' }
                 ], sessionID);
+                return; // skip plain error card
             }
         }
+
+        const patch = this._timeline.applyEvent(event);
+
+        // For message.updated: detect model/provider errors in message info
         if (event.type === 'message.updated') {
             const info = event.properties?.info;
             if (info?.error) {
@@ -782,7 +786,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         for (const message of snapshot.messages) {
             for (const part of message.parts) {
                 if (part.type === 'tool' && part.tool === 'question' && part.state?.status !== 'completed') {
-                    const requestID = this._pendingQuestions.get(part.callID);
+                    const key = `${part.sessionID}:${part.callID}`;
+                    const requestID = this._pendingQuestions.get(key);
                     if (requestID && !part._questionRequestID) {
                         part._questionRequestID = requestID;
                     }
@@ -828,9 +833,10 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         messageID?: string
     ): void {
         const now = Date.now();
-        const lastShown = this._errorDedup.get(message) || 0;
+        const dedupKey = `${sessionID || ''}:${message}`;
+        const lastShown = this._errorDedup.get(dedupKey) || 0;
         if (now - lastShown < 5000) return;
-        this._errorDedup.set(message, now);
+        this._errorDedup.set(dedupKey, now);
 
         const error = this._timeline.addError({
             sessionID: sessionID || this._currentSessionId,
