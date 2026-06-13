@@ -618,7 +618,8 @@ export class ApiClient {
 
     /**
      * Get available variant names (reasoning effort levels) for a specific model.
-     * Returns empty array if the model has no variants defined.
+     * Tries multiple field structures and falls back to common effort levels
+     * for reasoning-capable models.
      */
     getVariantsForModel(result: ProviderListResult, providerID: string, modelID: string): string[] {
         for (const provider of result.all || []) {
@@ -630,12 +631,56 @@ export class ApiClient {
                 : Object.entries(rawModels);
             for (const [mid, model] of entries) {
                 if (mid !== modelID) continue;
-                if (model?.variants && typeof model.variants === 'object') {
-                    return Object.keys(model.variants);
-                }
-                return [];
+                const variants = this.extractVariantOptions(model, pid, mid);
+                console.log(`[MiMoCode] Variant options for ${pid}/${mid}:`, variants, 'raw model:', model);
+                return variants;
             }
         }
+        return [];
+    }
+
+    /**
+     * Extract variant options from a model object, trying multiple field structures.
+     * Falls back to common effort levels for reasoning-capable models.
+     */
+    private extractVariantOptions(model: any, providerID: string, modelID: string): string[] {
+        if (!model) return [];
+
+        // 1. model.variants as Record<string, any> (most common from MiMoCode provider service)
+        if (model.variants && typeof model.variants === 'object' && !Array.isArray(model.variants)) {
+            const keys = Object.keys(model.variants).filter(k => k && k !== 'default');
+            if (keys.length > 0) return keys;
+        }
+        // 2. model.variants as string[]
+        if (Array.isArray(model.variants)) {
+            const filtered = model.variants.filter((v: any) => v && v !== 'default').map(String);
+            if (filtered.length > 0) return filtered;
+        }
+        // 3. model.variant as object or array
+        if (model.variant && typeof model.variant === 'object' && !Array.isArray(model.variant)) {
+            const keys = Object.keys(model.variant).filter(k => k && k !== 'default');
+            if (keys.length > 0) return keys;
+        }
+        if (Array.isArray(model.variant)) {
+            const filtered = model.variant.filter((v: any) => v && v !== 'default').map(String);
+            if (filtered.length > 0) return filtered;
+        }
+        // 4. model.reasoning?.efforts or model.reasoning?.variants
+        if (model.reasoning && typeof model.reasoning === 'object') {
+            if (Array.isArray(model.reasoning.efforts)) {
+                const filtered = model.reasoning.efforts.filter((v: any) => v && v !== 'default').map(String);
+                if (filtered.length > 0) return filtered;
+            }
+            if (model.reasoning.variants && typeof model.reasoning.variants === 'object') {
+                const keys = Object.keys(model.reasoning.variants).filter(k => k && k !== 'default');
+                if (keys.length > 0) return keys;
+            }
+        }
+        // 5. Fallback: if model has reasoning: true, provide common effort levels
+        if (model.reasoning === true) {
+            return ['low', 'medium', 'high'];
+        }
+        // 6. No variants found
         return [];
     }
 

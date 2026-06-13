@@ -160,16 +160,49 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
         this._currentModel = typeof config.model === 'string' ? config.model : undefined;
         this._effectiveModelRef = normalizeModelRef(this._currentModel);
 
-        // Compute models list and variant options
+        // Compute models list — filter to connected providers only
         if (providers) {
-            this._models = this._apiClient.normalizeModels(providers);
-            // Sort: connected provider models first
+            const allModels = this._apiClient.normalizeModels(providers);
             const connected = new Set(providers.connected || []);
-            this._models.sort((a, b) => {
-                const aConn = connected.has(a.providerID) ? 0 : 1;
-                const bConn = connected.has(b.providerID) ? 0 : 1;
-                return aConn - bConn;
-            });
+            const connectedModels = allModels.filter(m => connected.has(m.providerID));
+
+            if (connectedModels.length > 0) {
+                this._models = connectedModels;
+            } else {
+                this._models = allModels;
+                console.warn('[MiMoCode] No connected provider models; showing all models as fallback.');
+            }
+
+            // Ensure current configured model is in the list even if not in connected providers
+            if (this._currentModel && !this._models.some(m => m.label === this._currentModel)) {
+                this._models.unshift({
+                    label: this._currentModel,
+                    description: 'Current configured model',
+                    providerID: this._currentModel.split('/')[0] || '',
+                    modelID: this._currentModel.split('/').slice(1).join('/')
+                });
+            }
+
+            // Debug: log raw model info for current model
+            if (this._currentModel) {
+                const [pid, ...rest] = this._currentModel.split('/');
+                const mid = rest.join('/');
+                for (const provider of providers.all || []) {
+                    const pvid = provider.id || (provider as any).providerID || provider.name;
+                    if (pvid !== pid) continue;
+                    const rawModels = provider.models || [];
+                    const entries: [string, any][] = Array.isArray(rawModels)
+                        ? rawModels.map((m: any) => [m.id, m])
+                        : Object.entries(rawModels);
+                    for (const [mId, mObj] of entries) {
+                        if (mId === mid) {
+                            console.log('[MiMoCode] current model raw provider info', { model: this._currentModel, rawModel: mObj });
+                            break;
+                        }
+                    }
+                }
+            }
+
             // Update variant options for current model
             this.updateVariantOptions();
         } else {
@@ -548,18 +581,32 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
 
     /**
      * Public: set the current model. Called from webview or command palette.
+     * Verifies the change took effect after PATCH /config.
      */
     async setModel(modelRef: string): Promise<void> {
         if (!modelRef) return;
+        console.log(`[MiMoCode] setting model to ${modelRef}`);
         try {
             await this._apiClient.setModel(modelRef);
             await this.loadConfigAndProviders();
+
+            // Verify the model actually changed
+            const effective = normalizeModelRef(this._currentModel);
+            if (effective !== normalizeModelRef(modelRef)) {
+                this.showError(
+                    `Model did not change to ${modelRef}. Current model is ${this._currentModel || 'unknown'}. ` +
+                    `MiMoCode server may have rejected or ignored the config update.`
+                );
+                this.postShellState();
+                return;
+            }
+
+            console.log('[MiMoCode] Model set and verified', { modelRef });
             this.postShellState();
-            console.log(`[MiMoCode] Model set to ${modelRef}`);
         } catch (err) {
             const msg = toMessage(err);
-            const hint = /insufficient|balance|not supported|param incorrect/i.test(msg)
-                ? ' Please switch model or check provider account balance.'
+            const hint = /insufficient|balance|not supported|param incorrect|provider|unauthorized/i.test(msg)
+                ? ' Please switch to a connected provider model, or check provider login/balance.'
                 : '';
             this.showError(`Failed to set model: ${msg}${hint}`);
         }

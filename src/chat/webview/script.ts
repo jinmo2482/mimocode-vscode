@@ -272,6 +272,7 @@ function renderControls() {
       var o = document.createElement('option');
       o.value = m.label;
       o.textContent = m.label;
+      o.title = m.description || m.label;
       if (m.label === currentModel) { o.selected = true; found = true; }
       els.modelSelect.appendChild(o);
     }
@@ -279,6 +280,7 @@ function renderControls() {
       var o2 = document.createElement('option');
       o2.value = currentModel;
       o2.textContent = currentModel;
+      o2.title = 'Current configured model';
       o2.selected = true;
       els.modelSelect.insertBefore(o2, els.modelSelect.firstChild);
     }
@@ -289,22 +291,30 @@ function renderControls() {
   var variants = state.variantOptions || [];
   var currentVariant = state.variant || '';
   els.variantSelect.innerHTML = '';
-  // Always include a "default" option
-  var defOpt = document.createElement('option');
-  defOpt.value = '';
-  defOpt.textContent = 'default';
-  els.variantSelect.appendChild(defOpt);
-  for (var j = 0; j < variants.length; j++) {
-    var vo = document.createElement('option');
-    vo.value = variants[j];
-    vo.textContent = variants[j];
-    if (variants[j] === currentVariant) vo.selected = true;
-    els.variantSelect.appendChild(vo);
-  }
   if (variants.length === 0) {
+    // No variants available — show informative disabled state
+    var noVarOpt = document.createElement('option');
+    noVarOpt.value = '';
+    noVarOpt.textContent = 'default (no variants)';
+    noVarOpt.title = 'Current model does not expose reasoning effort variants';
+    els.variantSelect.appendChild(noVarOpt);
     els.variantSelect.disabled = true;
+    els.variantSelect.title = 'Current model does not expose reasoning effort variants';
   } else {
+    // Default option
+    var defOpt = document.createElement('option');
+    defOpt.value = '';
+    defOpt.textContent = 'default';
+    els.variantSelect.appendChild(defOpt);
+    for (var j = 0; j < variants.length; j++) {
+      var vo = document.createElement('option');
+      vo.value = variants[j];
+      vo.textContent = variants[j];
+      if (variants[j] === currentVariant) vo.selected = true;
+      els.variantSelect.appendChild(vo);
+    }
     els.variantSelect.disabled = !!state.busy;
+    els.variantSelect.title = '';
   }
 }
 
