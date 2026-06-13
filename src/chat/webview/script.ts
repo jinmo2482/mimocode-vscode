@@ -391,6 +391,30 @@ function renderTimeline() {
   for (var i = 0; i < sessionErrors.length; i++) {
     chunks.push(renderErrorCard(sessionErrors[i].message, sessionErrors[i].actions));
   }
+
+  // Collect question tool callIDs already rendered in message parts to avoid duplicates
+  var renderedQuestionCallIDs = {};
+  for (var mi = 0; mi < messages.length; mi++) {
+    var mparts = messages[mi].parts || [];
+    for (var pi = 0; pi < mparts.length; pi++) {
+      if (mparts[pi].type === 'tool' && mparts[pi].tool === 'question' &&
+          mparts[pi].state && mparts[pi].state.status !== 'completed') {
+        renderedQuestionCallIDs[mparts[pi].callID] = true;
+      }
+    }
+  }
+
+  // Render session-level pending questions (e.g. plan_exit) not yet in message parts
+  var pendingQs = timeline.pendingQuestions || [];
+  for (var pqi = 0; pqi < pendingQs.length; pqi++) {
+    var pqr = pendingQs[pqi];
+    var pqCallID = pqr.tool && pqr.tool.callID;
+    if (pqCallID && renderedQuestionCallIDs[pqCallID]) continue;
+    // Also skip if there are no questions
+    if (!pqr.questions || pqr.questions.length === 0) continue;
+    chunks.push(renderPendingQuestionRequest(pqr));
+  }
+
   for (var i = 0; i < (state.pendingDiffs || []).length; i++) {
     chunks.push(renderPendingDiff(state.pendingDiffs[i]));
   }
@@ -445,7 +469,10 @@ function renderPart(part) {
   switch (part.type) {
     case 'text':
       if (part.synthetic) return renderSyntheticContext(part.text || '');
-      return '<div class="part text">' + renderMarkdown(part.text || '') + '</div>';
+      // Hide <system-reminder> content — internal instructions, not user-facing
+      var text = stripSystemReminder(part.text || '');
+      if (!text.trim()) return '';
+      return '<div class="part text">' + renderMarkdown(text) + '</div>';
     case 'reasoning':
       return renderReasoning(part);
     case 'tool':
@@ -706,6 +733,84 @@ function renderQuestionTool(part) {
   }
 
   // Confirm button for multi-question
+  if (!isSingle) {
+    chunks.push('<div class="question-options">');
+    chunks.push('<button class="question-confirm-btn" data-action="confirmQuestions" disabled>Confirm (0/' + questions.length + ')</button>');
+    chunks.push('</div>');
+  }
+
+  chunks.push('</div>');
+  return chunks.join('');
+}
+
+/* ── Session-level pending question (from question.asked SSE, not from message part) ── */
+function renderPendingQuestionRequest(req) {
+  var questions = req.questions || [];
+  var requestID = req.id || '';
+  var sessionId = req.sessionID || '';
+  var toolCallId = (req.tool && req.tool.callID) || '';
+  var messageId = (req.tool && req.tool.messageID) || '';
+
+  // Detect plan_exit
+  var isPlanExit = false;
+  var planPath = '';
+  for (var pqi = 0; pqi < questions.length; pqi++) {
+    if (questions[pqi].key === 'plan_exit') {
+      isPlanExit = true;
+      planPath = (questions[pqi].params && questions[pqi].params.plan) || '';
+      break;
+    }
+  }
+
+  var isSingle = questions.length === 1 && !questions[0].multiple;
+  var cardId = toolCallId || ('pq_' + requestID);
+
+  var chunks = [];
+  chunks.push('<div class="card question-card" data-card-id="' + escapeAttr(cardId) + '" data-single="' + (isSingle ? '1' : '0') + '" data-total-questions="' + questions.length + '" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '">');
+  chunks.push('<div class="card-row">');
+  chunks.push('<span class="card-icon">' + (isPlanExit ? '&#x1F4CB;' : '&#x2753;') + '</span>');
+  chunks.push('<span class="card-title">' + (isPlanExit ? 'Plan' : 'Question') + '</span>');
+  chunks.push('<span class="card-badge pending">pending</span>');
+  chunks.push('</div>');
+
+  if (isPlanExit && planPath) {
+    chunks.push('<div class="question-header">Plan complete: ' + escapeHtml(planPath) + '</div>');
+    chunks.push('<div class="question-options">');
+    chunks.push('<button class="question-opt-btn" data-action="openPlanFile" data-plan-path="' + escapeAttr(planPath) + '">&#x1F4C2; Open Plan</button>');
+    chunks.push('</div>');
+  }
+
+  for (var qi = 0; qi < questions.length; qi++) {
+    var q = questions[qi];
+    var qheader = q.header || '';
+    var questionText = q.question || '';
+    var options = q.options || [];
+
+    if (qheader && !(isPlanExit && q.key === 'plan_exit')) {
+      chunks.push('<div class="question-header">' + escapeHtml(qheader) + '</div>');
+    }
+    if (questionText && !(isPlanExit && q.key === 'plan_exit')) {
+      chunks.push('<div class="question-text">' + escapeHtml(questionText) + '</div>');
+    }
+
+    if (options.length > 0) {
+      chunks.push('<div class="question-options" data-q-index="' + qi + '">');
+      for (var oi = 0; oi < options.length; oi++) {
+        var opt = options[oi];
+        var optLabel = typeof opt === 'string' ? opt : (opt.label || opt.value || '');
+        var optDesc = typeof opt === 'object' ? (opt.description || '') : '';
+        var optValue = typeof opt === 'object' ? (opt.label || opt.value || '') : opt;
+        chunks.push('<button class="question-opt-btn" data-action="answerQuestion" data-answer="' + escapeAttr(optValue) + '" data-q-index="' + qi + '">' + escapeHtml(optLabel) + (optDesc ? '<span class="question-opt-desc">' + escapeHtml(optDesc) + '</span>' : '') + '</button>');
+      }
+      chunks.push('</div>');
+    } else if (q.custom !== false) {
+      chunks.push('<div class="question-text-input">');
+      chunks.push('<input type="text" class="question-input" placeholder="Type your answer..." data-q-index="' + qi + '" />');
+      chunks.push('<button class="question-submit-btn" data-action="answerQuestionInput">Submit</button>');
+      chunks.push('</div>');
+    }
+  }
+
   if (!isSingle) {
     chunks.push('<div class="question-options">');
     chunks.push('<button class="question-confirm-btn" data-action="confirmQuestions" disabled>Confirm (0/' + questions.length + ')</button>');
@@ -1035,6 +1140,11 @@ function mapFiles(files) {
     out.push(f.path || f.filePath || f.newPath || f.oldPath || 'unknown');
   }
   return out;
+}
+/** Strip <system-reminder>...</system-reminder> blocks from text. */
+function stripSystemReminder(text) {
+  if (!text) return '';
+  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
 }
 function escapeHtml(value) {
   return String(value == null ? '' : value).replace(/[&<>"]/g, function(ch) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[ch]; });

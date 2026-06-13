@@ -8,6 +8,22 @@ import { DiffManager } from '../diff/diffManager';
 import { TimelineStore } from '../timeline/timelineStore';
 import { getHtml } from './webview/html';
 
+/** Full pending question request from question.asked SSE event. */
+interface PendingQuestionRequest {
+    id: string;
+    sessionID: string;
+    questions: Array<{
+        question?: string;
+        header?: string;
+        options?: Array<{ label: string; description?: string } | string>;
+        multiple?: boolean;
+        custom?: boolean;
+        key?: string;
+        params?: Record<string, string>;
+    }>;
+    tool?: { messageID?: string; callID?: string };
+}
+
 export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Disposable {
     public static readonly viewType = 'mimocode.chatView';
     private _view?: vscode.WebviewView;
@@ -24,7 +40,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     private _disposables: vscode.Disposable[] = [];
     private _busy = false;
     private _onSignInRequest?: () => void;
-    private _pendingQuestions = new Map<string, string>(); // sessionID+callID -> requestID
+    private _pendingQuestions = new Map<string, string>(); // sessionID+callID -> requestID (for answer lookup)
+    private _pendingQuestionRequests = new Map<string, PendingQuestionRequest>(); // requestID -> full request
     private _errorDedup = new Map<string, number>(); // message -> lastShown timestamp
 
     constructor(
@@ -241,6 +258,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
 
             // Clear pending question mappings when switching sessions
             this._pendingQuestions.clear();
+            this._pendingQuestionRequests.clear();
             this._errorDedup.clear();
             this._currentSessionId = sessionId;
             const [session, messages, statuses] = await Promise.all([
@@ -692,10 +710,23 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                 (event.properties?.part?.callID as string | undefined) ||
                 (event.properties?.toolCallId as string | undefined) ||
                 (event.properties?.toolCallID as string | undefined);
-            // Only track questions for the current session
-            if (requestID && callID && sessionID && sessionID === this._currentSessionId) {
-                const key = `${sessionID}:${callID}`;
-                this._pendingQuestions.set(key, requestID);
+            if (requestID && sessionID) {
+                // Store the full request for webview rendering
+                this._pendingQuestionRequests.set(requestID, {
+                    id: requestID,
+                    sessionID,
+                    questions: (event.properties?.questions as PendingQuestionRequest['questions']) || [],
+                    tool: callID ? { messageID: event.properties?.tool?.messageID as string | undefined, callID } : undefined
+                });
+                // Also maintain the callID → requestID map for answer lookup
+                if (callID && sessionID === this._currentSessionId) {
+                    const key = `${sessionID}:${callID}`;
+                    this._pendingQuestions.set(key, requestID);
+                }
+                // Re-post timeline to show new pending question
+                if (sessionID === this._currentSessionId) {
+                    this.postTimeline();
+                }
             }
             return;
         }
@@ -704,6 +735,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                 (event.properties?.requestID as string | undefined) ||
                 (event.properties?.id as string | undefined);
             const sessionID = event.properties?.sessionID as string | undefined;
+            if (requestID) {
+                this._pendingQuestionRequests.delete(requestID);
+            }
             if (requestID && sessionID) {
                 const prefix = `${sessionID}:`;
                 for (const [key, rid] of this._pendingQuestions.entries()) {
@@ -712,6 +746,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
                         break;
                     }
                 }
+            }
+            if (sessionID === this._currentSessionId) {
+                this.postTimeline();
             }
             return;
         }
@@ -821,6 +858,15 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider, vscode.Dis
     private postTimeline(): void {
         const snapshot = this._timeline.snapshot();
         this.injectQuestionRequestIDs(snapshot);
+        // Include session-level pending questions (e.g. plan_exit) that may not
+        // yet have a corresponding tool part in the message stream.
+        const pendingQuestions: PendingQuestionRequest[] = [];
+        for (const [rid, req] of this._pendingQuestionRequests) {
+            if (req.sessionID === this._currentSessionId) {
+                pendingQuestions.push(req);
+            }
+        }
+        (snapshot as any).pendingQuestions = pendingQuestions;
         this.postMessage({ type: 'timelineSnapshot', snapshot });
     }
 
