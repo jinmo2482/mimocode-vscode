@@ -697,6 +697,85 @@ body {
 }
 .question-submit-btn:hover { background: var(--vscode-button-hoverBackground); }
 
+/* ── Reasoning summary (collapsed Thought line) ── */
+.reasoning-summary {
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+  padding: 2px 0;
+  margin: 2px 0;
+  cursor: pointer;
+  user-select: none;
+}
+.reasoning-summary summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.reasoning-summary summary::-webkit-details-marker { display: none; }
+.reasoning-summary summary::before {
+  content: '▶';
+  display: inline-block;
+  width: 12px;
+  font-size: 9px;
+  transition: transform 0.15s;
+  color: var(--vscode-descriptionForeground);
+}
+.reasoning-summary[open] > summary::before { transform: rotate(90deg); }
+.reasoning-summary summary:hover { color: var(--vscode-textLink-foreground); }
+.reasoning-icon { flex-shrink: 0; }
+.reasoning-label { font-weight: 500; }
+.reasoning-duration { opacity: 0.6; }
+.reasoning-body {
+  padding: 4px 0 4px 16px;
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+  line-height: 1.4;
+}
+.reasoning-body pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  font-family: var(--vscode-font-family);
+  font-size: inherit;
+}
+
+/* ── Inline tool (single-line, TUI InlineTool) ── */
+.inline-tool {
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+  padding: 1px 0;
+  margin: 1px 0;
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+}
+.inline-tool-icon {
+  flex-shrink: 0;
+  width: 14px;
+  text-align: center;
+}
+.inline-tool-label {
+  font-weight: 500;
+  white-space: nowrap;
+}
+.inline-tool-desc {
+  opacity: 0.7;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.inline-tool-meta {
+  opacity: 0.5;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.inline-tool-error {
+  color: var(--vscode-errorForeground);
+}
+
 /* ── Hidden utility ── */
 .hidden { display: none; }
 `;

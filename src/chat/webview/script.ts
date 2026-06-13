@@ -396,7 +396,10 @@ function renderMessageError(info) {
   return renderErrorCard(errorText(info.error));
 }
 
-/* ── Part routing ── */
+/* ── Debug flag: set to true to show all parts (step-start, step-finish, etc.) ── */
+var SHOW_DETAILS = false;
+
+/* ── Part routing (aligned with TUI PART_MAPPING: text, tool, reasoning only) ── */
 function renderPart(part) {
   if (!part) return '';
   switch (part.type) {
@@ -404,61 +407,168 @@ function renderPart(part) {
       if (part.synthetic) return renderSyntheticContext(part.text || '');
       return '<div class="part text">' + renderMarkdown(part.text || '') + '</div>';
     case 'reasoning':
-      return renderCollapsible('Reasoning', part.text || '', 'part');
+      return renderReasoning(part);
     case 'tool':
       if (part.tool === 'question') {
         return renderQuestionTool(part);
       }
       return renderTool(part);
     case 'step-start':
-      return renderStepStart(part);
+      if (SHOW_DETAILS) return renderStepStart(part);
+      return '';
     case 'step-finish':
-      return renderStepFinish(part);
+      if (SHOW_DETAILS) return renderStepFinish(part);
+      return '';
     case 'retry':
       return renderRetry(part);
     case 'patch':
-      return renderPatch(part);
+      if (SHOW_DETAILS) return renderPatch(part);
+      return '';
     case 'file':
       return renderFile(part);
     case 'agent':
-      return renderAgentCard(part);
+      if (SHOW_DETAILS) return renderAgentCard(part);
+      return '';
     case 'subtask':
-      return renderSubtask(part);
+      if (SHOW_DETAILS) return renderSubtask(part);
+      return '';
     case 'checkpoint':
-      return renderCheckpoint(part);
+      if (SHOW_DETAILS) return renderCheckpoint(part);
+      return '';
     case 'compaction':
-      return renderCompaction(part);
+      if (SHOW_DETAILS) return renderCompaction(part);
+      return '';
     case 'snapshot':
-      return renderSnapshot(part);
+      if (SHOW_DETAILS) return renderSnapshot(part);
+      return '';
     default:
-      return renderCollapsible(part.type || 'part', JSON.stringify(part, null, 2), 'part');
+      if (SHOW_DETAILS) return renderCollapsible(part.type || 'part', JSON.stringify(part, null, 2), 'part');
+      return '';
   }
 }
 
-/* ── Tool card ── */
+/* ── Tool rendering (aligned with TUI InlineTool/BlockTool pattern) ── */
+var SIMPLE_TOOLS = {
+  glob: { icon: '&#x2731;', label: 'Glob' },
+  grep: { icon: '&#x2731;', label: 'Grep' },
+  read: { icon: '&#x2192;', label: 'Read' },
+  webfetch: { icon: '%', label: 'WebFetch' },
+  codesearch: { icon: '&#x25C7;', label: 'Code Search' },
+  websearch: { icon: '&#x25C8;', label: 'Web Search' },
+  skill: { icon: '&#x2192;', label: 'Skill' },
+  task: { icon: '#', label: 'Task' },
+  plan_exit: { icon: '&#x2699;', label: 'Plan exit' }
+};
+
 function renderTool(part) {
   var s = part.state || {};
-  var title = s.title || part.tool || 'tool';
   var status = s.status || 'pending';
+  var toolName = part.tool || 'tool';
+
+  // Hide completed tools with no error (TUI: shouldHide when showDetails=false)
+  if (!SHOW_DETAILS && status === 'completed' && !s.error) {
+    return '';
+  }
+
+  // Simple tools: inline one-liner
+  var simpleDef = SIMPLE_TOOLS[toolName];
+  if (simpleDef) {
+    return renderInlineTool(part, simpleDef);
+  }
+
+  // Complex tools (bash, write, edit, apply_patch, etc.): collapsible block card
+  return renderBlockTool(part);
+}
+
+/* ── Inline tool: single-line display (TUI InlineTool) ── */
+function renderInlineTool(part, def) {
+  var s = part.state || {};
+  var status = s.status || 'pending';
+  var icon = def.icon;
+  var label = def.label;
+
+  // Build description from input
+  var desc = '';
+  if (s.input) {
+    if (s.input.pattern) desc = '"' + truncate(s.input.pattern, 40) + '"';
+    else if (s.input.filePath) desc = truncate(s.input.filePath, 40);
+    else if (s.input.query) desc = '"' + truncate(s.input.query, 40) + '"';
+    else if (s.input.url) desc = truncate(s.input.url, 40);
+    else if (s.input.name) desc = '"' + truncate(s.input.name, 40) + '"';
+    else if (s.input.command) desc = truncate(s.input.command, 40);
+  }
+
+  // Metadata summary (e.g. match count)
+  var meta = '';
+  if (s.metadata) {
+    if (s.metadata.count) meta = ' (' + s.metadata.count + ' match' + (s.metadata.count !== 1 ? 'es' : '') + ')';
+    else if (s.metadata.matches) meta = ' (' + s.metadata.matches + ' match' + (s.metadata.matches !== 1 ? 'es' : '') + ')';
+    else if (s.metadata.numResults) meta = ' (' + s.metadata.numResults + ' results)';
+  }
+
+  if (status === 'running') {
+    return '<div class="inline-tool">' +
+      '<span class="inline-tool-icon">&#x23F3;</span> ' +
+      '<span class="inline-tool-label">' + escapeHtml(label) + '</span>' +
+      (desc ? ' <span class="inline-tool-desc">' + escapeHtml(desc) + '</span>' : '') +
+    '</div>';
+  }
+
+  if (status === 'error') {
+    var errMsg = s.error || 'error';
+    return '<div class="inline-tool inline-tool-error">' +
+      '<span class="inline-tool-icon">&#x2717;</span> ' +
+      '<span class="inline-tool-label">' + escapeHtml(label) + '</span>' +
+      (desc ? ' <span class="inline-tool-desc">' + escapeHtml(desc) + '</span>' : '') +
+      '<span class="inline-tool-meta">' + escapeHtml(truncate(errMsg, 60)) + '</span>' +
+    '</div>';
+  }
+
+  // completed or pending
+  return '<div class="inline-tool">' +
+    '<span class="inline-tool-icon">' + icon + '</span> ' +
+    '<span class="inline-tool-label">' + escapeHtml(label) + '</span>' +
+    (desc ? ' <span class="inline-tool-desc">' + escapeHtml(desc) + '</span>' : '') +
+    (meta ? '<span class="inline-tool-meta">' + escapeHtml(meta) + '</span>' : '') +
+  '</div>';
+}
+
+/* ── Block tool: collapsible card for complex tools (TUI BlockTool) ── */
+function renderBlockTool(part) {
+  var s = part.state || {};
+  var status = s.status || 'pending';
+  var toolName = part.tool || 'tool';
+  var title = s.title || toolName;
+  var icon = status === 'running' ? '&#x23F3;' : status === 'error' ? '&#x2717;' : '&#x25CB;';
   var badgeClass = status === 'running' ? 'running' : status === 'completed' ? 'completed' : status === 'error' ? 'error' : 'pending';
-  var icon = status === 'running' ? '&#x23F3;' : status === 'completed' ? '&#x2713;' : status === 'error' ? '&#x2717;' : '&#x25CB;';
   var body = s.output || s.error || s.raw || '';
-  var inputSummary = s.input ? truncate(JSON.stringify(s.input), 80) : '';
-  var summary = inputSummary || (body ? truncate(body, 60) : '');
-  var openAttr = status === 'running' ? ' open' : '';
-  var summaryLine = summary ? '<div class="card-summary">' + escapeHtml(summary) + '</div>' : '';
+  var openAttr = status === 'running' || status === 'error' ? ' open' : '';
+
+  // Build a compact header: tool name + key input param
+  var header = toolName;
+  if (s.input) {
+    if (s.input.command) header = '$ ' + truncate(s.input.command, 50);
+    else if (s.input.filePath) header = toolName + ' ' + truncate(s.input.filePath, 40);
+    else if (s.input.description) header = truncate(s.input.description, 50);
+  }
+
+  var summaryLine = '';
+  if (s.input && s.input.command && toolName === 'bash') {
+    summaryLine = '<div class="card-summary">' + escapeHtml('$ ' + s.input.command) + '</div>';
+  }
+
   return '<details class="card"' + openAttr + '>' +
     '<summary class="card-row">' +
       '<span class="card-icon">' + icon + '</span>' +
-      '<span class="card-title">' + escapeHtml(title) + '</span>' +
+      '<span class="card-title">' + escapeHtml(header) + '</span>' +
       '<span class="card-badge ' + badgeClass + '">' + escapeHtml(status) + '</span>' +
     '</summary>' +
     summaryLine +
-    (body ? '<div class="card-detail"><pre>' + escapeHtml(body) + '</pre></div>' : '') +
+    (body ? '<div class="card-detail"><pre>' + escapeHtml(truncate(body, 2000)) + '</pre></div>' : '') +
   '</details>';
 }
 
-/* ── Question tool ── */
+/* ── Question tool (aligned with TUI: pending=interactive, answered=collapsed) ── */
 function renderQuestionTool(part) {
   var s = part.state || {};
   var status = s.status || 'pending';
@@ -470,51 +580,63 @@ function renderQuestionTool(part) {
   var requestID = part._questionRequestID || '';
   var answered = status === 'completed' || status === 'error';
 
+  // Answered questions: collapsed one-liner (TUI: InlineTool "Asked N questions")
+  if (answered) {
+    var count = questions.length || 0;
+    var answers = s.metadata && s.metadata.answers;
+    var answerSummary = '';
+    if (answers && Array.isArray(answers)) {
+      var parts = [];
+      for (var ai = 0; ai < answers.length; ai++) {
+        if (answers[ai] && answers[ai].length) parts.push(answers[ai].join(', '));
+      }
+      answerSummary = parts.length ? ': ' + truncate(parts.join('; '), 60) : '';
+    }
+    return '<div class="inline-tool">' +
+      '<span class="inline-tool-icon">&#x2753;</span> ' +
+      '<span class="inline-tool-label">Asked ' + count + ' question' + (count !== 1 ? 's' : '') + '</span>' +
+      (answerSummary ? '<span class="inline-tool-meta">' + escapeHtml(answerSummary) + '</span>' : '') +
+    '</div>';
+  }
+
+  // Pending questions: full interactive card
   var chunks = [];
-  chunks.push('<div class="card question-card' + (answered ? ' answered' : '') + '">');
+  chunks.push('<div class="card question-card">');
   chunks.push('<div class="card-row">');
   chunks.push('<span class="card-icon">&#x2753;</span>');
   chunks.push('<span class="card-title">Question</span>');
-  chunks.push('<span class="card-badge ' + escapeAttr(status) + '">' + escapeHtml(status) + '</span>');
+  chunks.push('<span class="card-badge pending">pending</span>');
   chunks.push('</div>');
 
   for (var qi = 0; qi < questions.length; qi++) {
     var q = questions[qi];
-    var header = q.header || '';
+    var qheader = q.header || '';
     var questionText = q.question || '';
     var options = q.options || [];
 
-    if (header) {
-      chunks.push('<div class="question-header">' + escapeHtml(header) + '</div>');
+    if (qheader) {
+      chunks.push('<div class="question-header">' + escapeHtml(qheader) + '</div>');
     }
     if (questionText) {
       chunks.push('<div class="question-text">' + escapeHtml(questionText) + '</div>');
     }
 
-    if (!answered) {
-      if (options.length > 0) {
-        chunks.push('<div class="question-options">');
-        for (var oi = 0; oi < options.length; oi++) {
-          var opt = options[oi];
-          var optLabel = typeof opt === 'string' ? opt : (opt.label || opt.value || '');
-          var optDesc = typeof opt === 'object' ? (opt.description || opt.hint || '') : '';
-          var optValue = typeof opt === 'object' ? (opt.label || opt.value || '') : opt;
-          chunks.push('<button class="question-opt-btn" data-action="answerQuestion" data-answer="' + escapeAttr(optValue) + '" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '">' + escapeHtml(optLabel) + (optDesc ? '<span class="question-opt-desc">' + escapeHtml(optDesc) + '</span>' : '') + '</button>');
-        }
-        chunks.push('</div>');
-      } else {
-        // Free-text input fallback
-        chunks.push('<div class="question-text-input">');
-        chunks.push('<input type="text" class="question-input" placeholder="Type your answer..." data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '" />');
-        chunks.push('<button class="question-submit-btn" data-action="answerQuestionInput" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '">Submit</button>');
-        chunks.push('</div>');
+    if (options.length > 0) {
+      chunks.push('<div class="question-options">');
+      for (var oi = 0; oi < options.length; oi++) {
+        var opt = options[oi];
+        var optLabel = typeof opt === 'string' ? opt : (opt.label || opt.value || '');
+        var optDesc = typeof opt === 'object' ? (opt.description || opt.hint || '') : '';
+        var optValue = typeof opt === 'object' ? (opt.label || opt.value || '') : opt;
+        chunks.push('<button class="question-opt-btn" data-action="answerQuestion" data-answer="' + escapeAttr(optValue) + '" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '">' + escapeHtml(optLabel) + (optDesc ? '<span class="question-opt-desc">' + escapeHtml(optDesc) + '</span>' : '') + '</button>');
       }
+      chunks.push('</div>');
+    } else {
+      chunks.push('<div class="question-text-input">');
+      chunks.push('<input type="text" class="question-input" placeholder="Type your answer..." data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '" />');
+      chunks.push('<button class="question-submit-btn" data-action="answerQuestionInput" data-tool-call-id="' + escapeAttr(toolCallId) + '" data-message-id="' + escapeAttr(messageId) + '" data-session-id="' + escapeAttr(sessionId) + '" data-request-id="' + escapeAttr(requestID) + '">Submit</button>');
+      chunks.push('</div>');
     }
-  }
-
-  // Show output if already answered
-  if (s.output) {
-    chunks.push('<div class="card-detail"><pre>' + escapeHtml(s.output) + '</pre></div>');
   }
 
   chunks.push('</div>');
@@ -614,6 +736,55 @@ function renderCompaction(part) {
 function renderSnapshot(part) {
   var label = part.snapshot || '';
   return '<div class="step-line"><span class="step-icon">&#x1F4F8;</span><span class="step-text">Snapshot' + (label ? ': ' + escapeHtml(truncate(label, 50)) : '') + '</span></div>';
+}
+
+/* ── Reasoning (aligned with TUI: collapsed Thought · duration, click to expand) ── */
+function renderReasoning(part) {
+  var text = (part.text || '').replace('[REDACTED]', '').trim();
+  if (!text) return '';
+
+  var isDone = part.time && part.time.end !== undefined;
+  var duration = 0;
+  if (isDone && part.time) {
+    duration = Math.max(0, part.time.end - part.time.start);
+  }
+
+  // Extract title from leading **bold** pattern (same as TUI reasoningSummary)
+  var title = null;
+  var body = text;
+  var titleMatch = text.match(/^\*\*([^*\n]+)\*\*(?:\r?\n\r?\n|$)/);
+  if (titleMatch) {
+    title = titleMatch[1].trim();
+    body = text.slice(titleMatch[0].length).trimEnd();
+  }
+
+  var durationStr = duration > 0 ? formatDuration(duration) : '';
+  var summaryLabel = 'Thought';
+  if (title || durationStr) {
+    summaryLabel += ' · ';
+    if (title) summaryLabel += title;
+    if (title && durationStr) summaryLabel += ' · ';
+    if (durationStr) summaryLabel += durationStr;
+  }
+
+  // If thinking is still in progress
+  if (!isDone) {
+    return '<div class="reasoning-summary">' +
+      '<span class="reasoning-icon">&#x23F3;</span> ' +
+      '<span class="reasoning-label">Thinking' + (title ? ': ' + escapeHtml(title) : '') + '</span>' +
+    '</div>';
+  }
+
+  return '<details class="reasoning-summary">' +
+    '<summary><span class="reasoning-icon">&#x1F4AD;</span> ' + escapeHtml(summaryLabel) + '</summary>' +
+    '<div class="reasoning-body"><pre>' + escapeHtml(body) + '</pre></div>' +
+  '</details>';
+}
+
+function formatDuration(ms) {
+  if (ms < 1000) return ms + 'ms';
+  if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+  return Math.floor(ms / 60000) + 'm ' + Math.floor((ms % 60000) / 1000) + 's';
 }
 
 /* ── Session diff ── */
